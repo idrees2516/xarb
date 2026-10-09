@@ -1,0 +1,15 @@
+[package]
+name = "xarb-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+xarb-core = { path = "../xarb-core" }
+xarb-feed = { path = "../xarb-feed" }
+xarb-poly = { path = "../xarb-poly" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }

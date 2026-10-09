@@ -1,0 +1,199 @@
+//! xarb-server — axum HTTP + WebSocket terminal for the XARB Rust core.
+//!
+//!   GET  /              embedded dashboard (web/dashboard.html)
+//!   GET  /ws            live stream: init → 10Hz snapshots, signals, settles;
+//!                       inbound control: start/stop/reset/settings
+//!   GET  /api/snapshot  one-shot JSON snapshot
+//!   POST /api/control   {"type":"start"|"stop"|"reset"|"settings","settings":{…}}
+//!
+//! Local deployment:  MODE=paper cargo run --release   (default :3002)
+
+use anyhow::{bail, Context, Result};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc};
+use xarb_engine::{Engine, EngineConfig};
+use xarb_poly::{ClobClient, Creds};
+
+struct AppState {
+    engine: Arc<Engine>,
+    ctrl_tx: mpsc::UnboundedSender<serde_json::Value>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mode = std::env::var("XARB_MODE").unwrap_or_else(|_| "paper".into());
+    let port: u16 = std::env::var("XARB_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3002);
+
+    // ── CLOB client (paper vs live EIP-712 signing) ─────────────────────────
+    let (clob, cfg): (ClobClient, EngineConfig) = match mode.as_str() {
+        "live" => {
+            let confirm = std::env::var("XARB_LIVE_CONFIRM").unwrap_or_default();
+            if confirm != "I_UNDERSTAND_THE_RISK" {
+                bail!(
+                    "live mode requires XARB_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK \
+                     (real USDC at risk)"
+                );
+            }
+            let key = std::env::var("POLY_PRIVATE_KEY")
+                .context("live mode requires POLY_PRIVATE_KEY (wallet hex key)")?;
+            let creds = match (
+                std::env::var("POLY_API_KEY"),
+                std::env::var("POLY_SECRET"),
+                std::env::var("POLY_PASSPHRASE"),
+            ) {
+                (Ok(k), Ok(s), Ok(p)) => Some(Creds { api_key: k, secret: s, passphrase: p }),
+                _ => None,
+            };
+            let mut c = ClobClient::live(&key, creds)?;
+            println!("[boot] live mode — wallet {}", c.address_hex());
+            c.ensure_creds().await?;
+            let ok = c.verify_auth().await.unwrap_or(false);
+            println!("[boot] L2 auth verify: {}", if ok { "OK" } else { "FAILED (orders will error)" });
+            (c, EngineConfig { mode: "live", neg_risk: env_flag("XARB_NEG_RISK") })
+        }
+        _ => (ClobClient::paper(), EngineConfig { mode: "paper", neg_risk: false }),
+    };
+
+    // ── engine ─────────────────────────────────────────────────────────────
+    let (out_tx, _): (broadcast::Sender<String>, broadcast::Receiver<String>) =
+        broadcast::channel(2048);
+    let mode_label = cfg.mode;
+    let neg_risk = cfg.neg_risk;
+    let engine = Engine::new(cfg, clob, out_tx);
+    apply_env_settings(&engine);
+    let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+    engine.start(ctrl_rx);
+
+    // ── axum ───────────────────────────────────────────────────────────────
+    let state = Arc::new(AppState {
+        engine: engine.clone(),
+        ctrl_tx,
+    });
+    let app = Router::new()
+        .route("/", get(root))
+        .route("/ws", get(ws_handler))
+        .route("/api/snapshot", get(api_snapshot))
+        .route("/api/control", post(api_control))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .with_context(|| format!("bind :{port}"))?;
+    println!("[boot] XARB rust core — {} mode — http://127.0.0.1:{port}{}", mode_label, if neg_risk { " (neg-risk)" } else { "" });
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn env_flag(k: &str) -> bool {
+    let v = std::env::var(k).unwrap_or_default();
+    v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+}
+
+fn env_num(k: &str) -> Option<f64> {
+    std::env::var(k).ok().and_then(|v| v.parse().ok())
+}
+
+fn apply_env_settings(engine: &Arc<Engine>) {
+    let mut j = serde_json::json!({});
+    if let Some(v) = env_num("XARB_STAKE_USD") {
+        j["stakeUsd"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_JUMP_C") {
+        j["jumpThreshC"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_FLOOR_C") {
+        j["fvFloorC"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_EDGE_C") {
+        j["edgeThreshC"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_MIN_SECS") {
+        j["minSecsLeft"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_MAX_TRADES") {
+        j["maxTradesPerWindow"] = serde_json::json!(v);
+    }
+    if let Ok(v) = std::env::var("XARB_MODEL") {
+        j["model"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_TAKER_FEE_BPS") {
+        j["takerFeeBps"] = serde_json::json!(v);
+    }
+    if let Ok(v) = std::env::var("XARB_AUTO_TRADE") {
+        j["autoTrade"] = serde_json::json!(v != "0" && !v.eq_ignore_ascii_case("false"));
+    }
+    if j.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+        engine.settings.lock().unwrap().patch(&j);
+        println!("[boot] env settings: {j}");
+    }
+}
+
+async fn root() -> Html<&'static str> {
+    Html(include_str!("../../../web/dashboard.html"))
+}
+
+async fn api_snapshot(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(xarb_engine::snapshot::build(&st.engine))
+}
+
+async fn api_control(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let _ = st.ctrl_tx.send(body);
+    Json(serde_json::json!({ "ok": true }))
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> Response {
+    ws.on_upgrade(move |socket| handle_socket(socket, st))
+}
+
+async fn handle_socket(mut socket: WebSocket, st: Arc<AppState>) {
+    // initial state: full snapshot + history + logs + settings
+    let init = xarb_engine::snapshot::build_init(&st.engine);
+    if socket.send(Message::Text(init.to_string())).await.is_err() {
+        return;
+    }
+    let mut rx = st.engine.out_tx.subscribe();
+    loop {
+        tokio::select! {
+            // inbound control
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(txt))) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                            let _ = st.ctrl_tx.send(v);
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => return,
+                }
+            }
+            // outbound stream (10Hz snaps + signals + settles)
+            out = rx.recv() => {
+                match out {
+                    Ok(s) => {
+                        if socket.send(Message::Text(s)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        let _ = socket.send(Message::Text(
+                            serde_json::json!({ "type": "lagged", "missed": n }).to_string(),
+                        )).await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+    }
+}

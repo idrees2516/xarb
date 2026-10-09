@@ -83,8 +83,8 @@ export function SettingsSheet({ trigger }: { trigger: React.ReactNode }) {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent className="border-[#262b33] bg-[#12151b] text-zinc-200">
-                <SelectItem value="linear">Linear — spec-calibrated (52 + slope·(S−K))</SelectItem>
-                <SelectItem value="cdf">Normal CDF — Φ((S−K)/σ√T), σ realized</SelectItem>
+                <SelectItem value="cdf">Normal CDF — Φ(z) · σ-floor 15.5 · honest tails</SelectItem>
+                <SelectItem value="linear">Linear — legacy spec (52 + slope·(S−K))</SelectItem>
               </SelectContent>
             </Select>
           </SettingRow>

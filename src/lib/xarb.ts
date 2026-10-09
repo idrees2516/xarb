@@ -78,7 +78,7 @@ export const DEFAULT_SETTINGS: Settings = {
   edgeThreshC: 10,
   minSecsLeft: 45,
   maxTradesPerWindow: 1,
-  model: 'linear',
+  model: 'cdf',
   takerFeeBps: 0,
   maxBookAgeMs: 3000,
 }
@@ -107,6 +107,8 @@ export interface Snapshot {
     jump5s: number
     model: string
     sigmaPts: number
+    sigmaEffPts: number
+    z: number
     slope: number
     distFromStrike: number
   }

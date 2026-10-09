@@ -51,9 +51,11 @@ export function StatCards() {
   const question = useXarb((s) => s.snapshot?.window.question ?? '')
   const fv = useXarb((s) => s.snapshot?.fv.value ?? 50)
   const jump5s = useXarb((s) => s.snapshot?.fv.jump5s ?? 0)
-  const model = useXarb((s) => s.snapshot?.fv.model ?? 'linear')
+  const model = useXarb((s) => s.snapshot?.fv.model ?? 'cdf')
   const dist = useXarb((s) => s.snapshot?.fv.distFromStrike ?? 0)
   const slope = useXarb((s) => s.snapshot?.fv.slope ?? 0)
+  const zScore = useXarb((s) => s.snapshot?.fv.z ?? 0)
+  const sigmaEffPts = useXarb((s) => s.snapshot?.fv.sigmaEffPts ?? 15.5)
   const pmAsk = useXarb((s) => s.snapshot?.pm.ask ?? null)
   const pmBid = useXarb((s) => s.snapshot?.pm.bid ?? null)
   const askSize = useXarb((s) => s.snapshot?.pm.askSize ?? 0)
@@ -104,7 +106,7 @@ export function StatCards() {
         </div>
       </Card>
 
-      <Card title="UP fair value" hint={model === 'linear' ? 'linear spec model' : 'normal-cdf model'} accent="bg-emerald-500/70">
+      <Card title="UP fair value" hint={model === 'linear' ? 'linear spec model' : 'normal-cdf · calibrated'} accent="bg-emerald-500/70">
         <div className={`${big} text-emerald-300`}>{fmtCents(fv)}</div>
         <div className={sub}>
           <span>5sΔ</span>
@@ -113,8 +115,11 @@ export function StatCards() {
         </div>
         <div className={sub}>
           <span className="text-zinc-600">
-            slope {slope.toFixed(3)}¢/pt · {model === 'linear' ? '52 + slope·(S−K)' : 'Φ((S−K)/σ√T)'}
+            z {zScore >= 0 ? '+' : ''}{zScore.toFixed(2)}σ · σ_eff {sigmaEffPts.toFixed(1)} · slope {slope.toFixed(3)}¢/pt
           </span>
+        </div>
+        <div className={sub}>
+          <span className="text-zinc-600">{model === 'linear' ? '52 + slope·(S−K)' : 'Φ(z) · bounded 1–99¢ · honest tails'}</span>
         </div>
       </Card>
 

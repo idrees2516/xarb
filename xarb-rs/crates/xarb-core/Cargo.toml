@@ -1,0 +1,6 @@
+[package]
+name = "xarb-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

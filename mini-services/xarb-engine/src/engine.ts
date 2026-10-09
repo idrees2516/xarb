@@ -4,7 +4,7 @@
 
 import { BinanceFeed } from './binance'
 import { PolymarketFeed } from './polymarket'
-import { fvLinear, fvCdf, percentile } from './fairvalue'
+import { fvLinear, fvCdf, fvCdfDetail, sigmaEff, percentile } from './fairvalue'
 import {
   DEFAULT_SETTINGS,
   type ChartPoint,
@@ -34,6 +34,12 @@ const localMidnight = () => {
   return d.getTime()
 }
 const uid = () => Math.random().toString(36).slice(2, 9)
+
+/** z-score helper for the linear model row (still uses CDF σ for context). */
+function d0(sigmaPts: number, tSec: number, price: number, strike: number): number {
+  const sd = Math.max(sigmaEff(sigmaPts) * Math.sqrt(Math.max(tSec, 1)), 5)
+  return (price - strike) / sd
+}
 
 export class Engine {
   settings: Settings = { ...DEFAULT_SETTINGS }
@@ -476,8 +482,20 @@ export class Engine {
     const last = this.chart[this.chart.length - 1]
     const tSec = win ? Math.max(0, (win.endEpoch * 1000 - now) / 1000) : 0
     const dist = win?.strike != null ? price - win.strike : 0
-    const slopeInfo =
-      win?.strike != null ? fvLinear(price, win.strike, Math.max(tSec, 1)) : { value: 50, slope: 0.19 }
+    // FV detail: slope is the ACTIVE model's local slope (¢/pt); z/sd from the CDF.
+    let slope = 0.19
+    let z = 0
+    if (win?.strike != null) {
+      const t = Math.max(tSec, 1)
+      if (this.settings.model === 'cdf') {
+        const d = fvCdfDetail(price, win.strike, t, this.bin.volPts)
+        slope = d.slope
+        z = d.z
+      } else {
+        slope = fvLinear(price, win.strike, t).slope
+        z = d0(this.bin.volPts, t, price, win.strike)
+      }
+    }
 
     const open = this.trades.filter((t) => t.status === 'OPEN')
     let unreal = 0
@@ -529,7 +547,9 @@ export class Engine {
         jump5s: this.jump5sNow(),
         model: this.settings.model,
         sigmaPts: this.bin.volPts,
-        slope: slopeInfo.slope,
+        sigmaEffPts: sigmaEff(this.bin.volPts),
+        z,
+        slope,
         distFromStrike: dist,
       },
       pm: {

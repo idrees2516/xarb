@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>XARB · Rust Core</title>
+<style>
+  :root {
+    --bg: #0b0e13; --panel: #12151b; --panel2: #161a21; --line: #232833;
+    --txt: #d7dde6; --dim: #8a94a3; --faint: #566070;
+    --em: #34d399; --am: #fbbf24; --rd: #f87171; --bl: #60a5fa;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: var(--bg); color: var(--txt); font: 12px/1.45 "SF Mono", ui-monospace, Menlo, Consolas, monospace; }
+  body { padding: 14px 16px 28px; }
+  .mono-num { font-variant-numeric: tabular-nums; }
+
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .brand { font-size: 15px; font-weight: 700; letter-spacing: 2px; }
+  .brand em { color: var(--em); font-style: normal; }
+  .badge { padding: 2px 8px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel); color: var(--dim); }
+  .badge.on { color: var(--em); border-color: rgba(52,211,153,.4); }
+  .badge.live { color: var(--am); border-color: rgba(251,191,36,.4); }
+  .badge.err { color: var(--rd); border-color: rgba(248,113,113,.4); }
+  .sp { flex: 1; }
+  button { background: var(--panel2); color: var(--txt); border: 1px solid var(--line); border-radius: 4px; padding: 4px 12px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--em); color: var(--em); }
+  button.danger:hover { border-color: var(--rd); color: var(--rd); }
+
+  .grid { display: grid; gap: 10px; grid-template-columns: repeat(6, 1fr); }
+  @media (max-width: 1100px) { .grid { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 640px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; min-width: 0; }
+  .card h3 { font-size: 9px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--faint); margin-bottom: 6px; }
+  .big { font-size: 22px; font-weight: 600; }
+  .row { display: flex; gap: 10px; align-items: baseline; margin-top: 4px; color: var(--dim); font-size: 10.5px; flex-wrap: wrap; }
+  .em { color: var(--em); } .am { color: var(--am); } .rd { color: var(--rd); } .bl { color: var(--bl); }
+
+  .wide { grid-column: span 3; }
+  @media (max-width: 1100px) { .wide { grid-column: span 3; } }
+  canvas { width: 100%; height: 170px; display: block; background: var(--panel2); border-radius: 4px; }
+
+  .trig { display: flex; gap: 6px; align-items: center; padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; margin-bottom: 6px; }
+  .led { width: 9px; height: 9px; border-radius: 50%; background: #2a2f39; flex: none; }
+  .led.on { background: var(--em); box-shadow: 0 0 8px rgba(52,211,153,.8); }
+  .bar { flex: 1; height: 4px; background: #1a1e25; border-radius: 2px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--em); transition: width .25s; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+  th { color: var(--faint); text-align: left; font-weight: 500; padding: 3px 6px; border-bottom: 1px solid var(--line); font-size: 9px; letter-spacing: 1px; text-transform: uppercase; }
+  td { padding: 3px 6px; border-bottom: 1px solid #1a1e25; color: var(--dim); }
+  td.num { text-align: right; }
+  .scroll { max-height: 220px; overflow-y: auto; }
+  .scroll::-webkit-scrollbar { width: 6px; } .scroll::-webkit-scrollbar-thumb { background: #262b33; border-radius: 3px; }
+
+  .book .lv { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; font-size: 10.5px; }
+  .book .lv span { display: flex; justify-content: space-between; padding: 1px 4px; border-radius: 2px; }
+
+  label { display: flex; justify-content: space-between; align-items: center; gap: 10px; color: var(--dim); font-size: 10.5px; padding: 3px 0; }
+  input[type=range] { width: 130px; accent-color: var(--em); }
+  select, input[type=number] { background: var(--panel2); color: var(--txt); border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; font: inherit; }
+  footer { margin-top: 14px; color: var(--faint); font-size: 10px; text-align: center; }
+  #toasts { position: fixed; right: 14px; top: 14px; display: flex; flex-direction: column; gap: 6px; z-index: 9; }
+  .toast { background: var(--panel2); border: 1px solid var(--line); border-left: 3px solid var(--em); padding: 6px 12px; border-radius: 4px; min-width: 220px; animation: fade 4s forwards; }
+  .toast.err { border-left-color: var(--rd); }
+  @keyframes fade { 0% {opacity:0} 8% {opacity:1} 80% {opacity:1} 100% {opacity:0} }
+</style>
+</head>
+<body>
+<div id="toasts"></div>
+<header>
+  <div class="brand">XARB <em>RUST CORE</em></div>
+  <span class="badge" id="b-mode">—</span>
+  <span class="badge" id="b-run">engine</span>
+  <span class="badge" id="b-bin">binance: —</span>
+  <span class="badge" id="b-pm">polymarket: —</span>
+  <span class="badge" id="b-lat">decision p50 —</span>
+  <div class="sp"></div>
+  <button id="btn-start">Start</button>
+  <button id="btn-stop">Stop</button>
+  <button id="btn-reset" class="danger">Reset</button>
+</header>
+
+<div class="grid">
+  <div class="card"><h3>BTC · Binance</h3>
+    <div class="big em mono-num" id="v-px">—</div>
+    <div class="row"><span>5s <b id="v-chg" class="mono-num">—</b></span><span>spread <b id="v-spr" class="mono-num">—</b></span><span id="v-tpm" class="mono-num">—</span></div>
+  </div>
+  <div class="card"><h3>Window · 5m</h3>
+    <div class="big am mono-num" id="v-cd">—</div>
+    <div class="row"><span>strike <b id="v-k" class="mono-num">—</b></span><span id="v-slug" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span></div>
+  </div>
+  <div class="card"><h3>UP fair value · normal-cdf</h3>
+    <div class="big em mono-num" id="v-fv">—</div>
+    <div class="row"><span>5sΔ <b id="v-jump" class="mono-num">—</b></span><span>K<b id="v-dist" class="mono-num">—</b></span></div>
+    <div class="row"><span class="mono-num" id="v-z">—</span></div>
+  </div>
+  <div class="card"><h3>Polymarket UP · CLOB</h3>
+    <div class="big am mono-num" id="v-ask">—</div>
+    <div class="row"><span>bid <b id="v-bid" class="mono-num">—</b></span><span>sz <b id="v-sz" class="mono-num">—</b></span><span>age <b id="v-age" class="mono-num">—</b></span></div>
+  </div>
+  <div class="card"><h3>Edge · FV − ask</h3>
+    <div class="big mono-num" id="v-edge">—</div>
+    <div class="row"><span id="v-edge-note">—</span></div>
+  </div>
+  <div class="card"><h3>P&amp;L</h3>
+    <div class="big mono-num" id="v-pnl">—</div>
+    <div class="row"><span>open <b id="v-open" class="mono-num">—</b></span><span>W/L <b id="v-wl" class="mono-num">—</b></span><span>win% <b id="v-wr" class="mono-num">—</b></span></div>
+  </div>
+
+  <div class="card wide"><h3>BTC vs strike</h3><canvas id="c-px"></canvas></div>
+  <div class="card wide"><h3>FV vs Polymarket ask · edge shading</h3><canvas id="c-fv"></canvas></div>
+
+  <div class="card"><h3>Triggers</h3>
+    <div class="trig"><span class="led" id="t1"></span><span style="width:112px">① 5s jump ≥ <b id="th-j">20</b>¢</span><div class="bar"><i id="tb1"></i></div><b id="tv1" class="mono-num">—</b></div>
+    <div class="trig"><span class="led" id="t2"></span><span style="width:112px">② FV &gt; <b id="th-f">60</b>¢</span><div class="bar"><i id="tb2"></i></div><b id="tv2" class="mono-num">—</b></div>
+    <div class="trig"><span class="led" id="t3"></span><span style="width:112px">③ gap ≥ <b id="th-e">10</b>¢</span><div class="bar"><i id="tb3"></i></div><b id="tv3" class="mono-num">—</b></div>
+    <div class="trig"><span class="led" id="tA"></span><span style="width:112px" class="em">ALL → BUY UP</span><div class="bar"><i id="tbA"></i></div><b id="tvA">—</b></div>
+  </div>
+
+  <div class="card"><h3>CLOB book (¢)</h3>
+    <div class="book" id="book"></div>
+  </div>
+
+  <div class="card"><h3>Latency</h3>
+    <table>
+      <tr><th>path</th><th class="num">p50</th><th class="num">p99</th></tr>
+      <tr><td>binance feed</td><td class="num mono-num" id="l-fp50">—</td><td class="num mono-num" id="l-fp99">—</td></tr>
+      <tr><td>decision (hot)</td><td class="num mono-num" id="l-dp50">—</td><td class="num mono-num" id="l-dp99">—</td></tr>
+      <tr><td>tick 10Hz</td><td class="num mono-num" id="l-tp50">—</td><td class="num mono-num" id="l-tp99">—</td></tr>
+    </table>
+    <div class="row"><span class="mono-num" id="l-note">—</span></div>
+  </div>
+
+  <div class="card"><h3>Stats</h3>
+    <table>
+      <tr><td>triggers today</td><td class="num mono-num" id="s-trg">—</td></tr>
+      <tr><td>trades</td><td class="num mono-num" id="s-trd">—</td></tr>
+      <tr><td>staked</td><td class="num mono-num" id="s-stk">—</td></tr>
+      <tr><td>avg edge</td><td class="num mono-num" id="s-edg">—</td></tr>
+      <tr><td>realized</td><td class="num mono-num" id="s-re">—</td></tr>
+      <tr><td>unrealized</td><td class="num mono-num" id="s-un">—</td></tr>
+    </table>
+  </div>
+
+  <div class="card" style="grid-column: span 6;"><h3>Signals</h3>
+    <div class="scroll"><table>
+      <thead><tr><th>time</th><th>act</th><th>fv</th><th class="num">ask</th><th class="num">edge</th><th class="num">jump</th><th class="num">left</th><th>reason</th></tr></thead>
+      <tbody id="sig"></tbody>
+    </table></div>
+  </div>
+
+  <div class="card" style="grid-column: span 6;"><h3>Trades</h3>
+    <div class="scroll"><table>
+      <thead><tr><th>time</th><th>id</th><th class="num">entry ¢</th><th class="num">shares</th><th class="num">cost</th><th class="num">fv@e</th><th class="num">edge@e</th><th>status</th><th class="num">pnl</th></tr></thead>
+      <tbody id="trd"></tbody>
+    </table></div>
+  </div>
+
+  <div class="card" style="grid-column: span 6;"><h3>Settings (live)</h3>
+    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 2px 18px;">
+      <label>FV model <select id="set-model"><option value="cdf" selected>Normal CDF (calibrated)</option><option value="linear">Linear (legacy)</option></select></label>
+      <label>auto-trade <input type="checkbox" id="set-auto" checked></label>
+      <label>stake $ <input type="number" id="set-stake" value="25" min="1" step="1" style="width:70px"></label>
+      <label>① 5s jump ¢ <input type="range" id="set-jump" min="5" max="60" step="1" value="20"><b id="set-jump-v" class="mono-num">20</b></label>
+      <label>② FV floor ¢ <input type="range" id="set-floor" min="30" max="95" step="1" value="60"><b id="set-floor-v" class="mono-num">60</b></label>
+      <label>③ edge ¢ <input type="range" id="set-edge" min="2" max="40" step="1" value="10"><b id="set-edge-v" class="mono-num">10</b></label>
+      <label>min secs left <input type="range" id="set-secs" min="0" max="180" step="5" value="45"><b id="set-secs-v" class="mono-num">45</b></label>
+      <label>max trades/window <input type="range" id="set-max" min="1" max="5" step="1" value="1"><b id="set-max-v" class="mono-num">1</b></label>
+      <label>taker fee bps <input type="range" id="set-fee" min="0" max="100" step="5" value="0"><b id="set-fee-v" class="mono-num">0</b></label>
+      <label>book max age ms <input type="range" id="set-age" min="200" max="10000" step="100" value="3000"><b id="set-age-v" class="mono-num">3000</b></label>
+    </div>
+  </div>
+</div>
+<footer>XARB rust core · direct Binance WS → normal-cdf FV → 3-trigger AND → paper/EIP-712 live fills · local deployment</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const fmt = (v, d=2) => v==null||!isFinite(v) ? "—" : v.toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
+const c1 = (v, d=1) => v==null||!isFinite(v) ? "—" : v.toFixed(d)+"¢";
+const us = (v) => !isFinite(v)||v<=0 ? "—" : v<1000 ? v.toFixed(0)+"µs" : (v/1000).toFixed(2)+"ms";
+const clock = (t) => new Date(t).toLocaleTimeString("en-US",{hour12:false});
+const cd = (s) => { s=Math.max(0,Math.floor(s)); return Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); };
+const pnl = (v) => v==null||!isFinite(v) ? "—" : (v>=0?"+":"−")+"$"+Math.abs(v).toFixed(2);
+
+// ── live state ───────────────────────────────────────────────────────────
+let snap = null, connected = false;
+let chart = [], lastT = 0;
+
+function toast(msg, err) {
+  const d = document.createElement("div");
+  d.className = "toast" + (err ? " err" : "");
+  d.textContent = msg;
+  $("toasts").appendChild(d);
+  setTimeout(() => d.remove(), 4200);
+}
+
+// ── websocket ────────────────────────────────────────────────────────────
+let ws = null, retry = 0;
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  // gateway mode: keep the XTransformPort routing param on the WS handshake
+  const port = new URLSearchParams(location.search).get("XTransformPort");
+  const wsUrl = `${proto}://${location.host}/ws` + (port ? `?XTransformPort=${port}` : "");
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => { retry = 0; connected = true; };
+  ws.onclose = () => { connected = false; setTimeout(connect, Math.min(1000*Math.pow(2,retry++), 8000)); };
+  ws.onmessage = (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.type === "init") {
+      snap = m; chart = m.history || [];
+      applySettings(m.settings || {});
+      $("b-mode").textContent = (m.mode||"paper").toUpperCase() + (m.mode==="live" ? " · REAL USDC" : " · SIM FILLS");
+      $("b-mode").className = "badge " + (m.mode==="live" ? "live" : "on");
+      renderSignals(m.signals||[]); renderTrades(m.trades||[]);
+    } else if (m.type === "snap") { snap = m; pushChart(m.chart); }
+    else if (m.type === "signal") { pushSignal(m); if (m.action==="EXECUTED") toast(`BUY UP filled @ ${(m.fillPrice??0).toFixed(1)}¢ · edge +${(m.edge??0).toFixed(1)}¢`); }
+    else if (m.type === "settle") { settleTrade(m); toast(`${m.status} · ${pnl(m.pnlUsd)}`, m.status==="LOST"); }
+  };
+}
+connect();
+
+function send(o) { if (ws && ws.readyState===1) ws.send(JSON.stringify(o)); }
+
+function pushChart(p) {
+  if (!p || !p.t || p.t <= lastT) return;
+  lastT = p.t; chart.push(p);
+  if (chart.length > 1600) chart.shift();
+}
+
+// ── render (rAF-throttled) ───────────────────────────────────────────────
+let dirty = true;
+setInterval(() => { dirty = true; }, 100);
+
+function render() {
+  if (!dirty || !snap) return;
+  dirty = false;
+  const s = snap;
+  const run = s.running !== false;
+  $("b-run").textContent = "engine " + (run ? "RUNNING" : "STOPPED");
+  $("b-run").className = "badge " + (run ? "on" : "err");
+  $("b-bin").textContent = "binance: " + (s.feeds?.binance?.status ?? "—");
+  $("b-bin").className = "badge " + (s.feeds?.binance?.status === "live" ? "on" : "err");
+  $("b-pm").textContent = "polymarket: " + (s.feeds?.polymarket?.status ?? "—");
+  $("b-pm").className = "badge " + (s.feeds?.polymarket?.status === "live" ? "on" : "err");
+  const d50 = s.latency?.decisionUsP50 ?? 0;
+  $("b-lat").textContent = "decision p50 " + us(d50);
+  $("b-lat").className = "badge " + (d50 > 0 && d50 < 1000 ? "on" : "");
+
+  $("v-px").textContent = fmt(s.binance?.price);
+  $("v-chg").textContent = (s.binance?.change5s ?? 0).toFixed(1);
+  $("v-chg").className = "mono-num " + ((s.binance?.change5s ?? 0) >= 0 ? "em" : "rd");
+  $("v-spr").textContent = fmt(s.binance?.spread, 1);
+  $("v-tpm").textContent = fmt(s.feeds?.binance?.ticksPerMin, 0) + " tpm";
+
+  $("v-cd").textContent = cd(s.window?.secondsLeft ?? 0);
+  $("v-k").textContent = fmt(s.window?.strike, 1);
+  $("v-slug").textContent = s.window?.slug ?? "—";
+
+  const fv = s.fv?.value ?? null;
+  $("v-fv").textContent = c1(fv);
+  $("v-jump").textContent = (s.fv?.jump5s ?? 0).toFixed(1);
+  $("v-jump").className = "mono-num " + ((s.fv?.jump5s ?? 0) >= 0 ? "em" : "rd");
+  $("v-dist").textContent = (s.fv?.distFromStrike ?? 0) >= 0 ? "+"+Math.round(s.fv.distFromStrike) : Math.round(s.fv.distFromStrike);
+  $("v-z").textContent = `z ${(s.fv?.z ?? 0).toFixed(2)}σ · σ_eff ${(s.fv?.sigmaEffPts ?? 0).toFixed(1)} pts/√s · slope ${(s.fv?.slope ?? 0).toFixed(3)}¢/pt`;
+
+  const ask = s.pm?.ask, edge = s.edge?.fvAsk;
+  $("v-ask").textContent = c1(ask);
+  $("v-bid").textContent = c1(s.pm?.bid);
+  $("v-sz").textContent = Math.round(s.pm?.askSize ?? 0);
+  const age = s.pm?.bookAgeMs ?? 999999;
+  $("v-age").textContent = age > 99999 ? "—" : Math.round(age)+"ms";
+  $("v-age").className = "mono-num " + (age > 3000 ? "rd" : "");
+
+  const thE = +($("set-edge").value) || 10;
+  $("v-edge").textContent = edge == null ? "—" : (edge>=0?"+":"")+edge.toFixed(1)+"¢";
+  $("v-edge").className = "big mono-num " + (edge==null ? "" : edge >= thE ? "em" : edge >= thE-3 ? "am" : "rd");
+  $("v-edge-note").textContent = edge == null ? "no quote" : Math.max(0, thE-edge).toFixed(1)+"¢ to go";
+
+  const p = s.stats ?? {};
+  $("v-pnl").textContent = pnl(p.pnlTotal);
+  $("v-pnl").className = "big mono-num " + ((p.pnlTotal ?? 0) >= 0 ? "em" : "rd");
+  $("v-open").textContent = p.open ?? 0;
+  $("v-wl").textContent = `${p.wins ?? 0}/${p.losses ?? 0}`;
+  $("v-wr").textContent = (p.winRate ?? 0).toFixed(0)+"%";
+
+  // triggers
+  const t = s.triggers ?? {};
+  const jv = s.fv?.jump5s ?? 0, jj = +$("set-jump").value, ff = +$("set-floor").value;
+  setTrig("t1","tb1","tv1", t.jump, Math.max(0,Math.min(1,jv/jj)), jv.toFixed(1)+"¢");
+  setTrig("t2","tb2","tv2", t.above60, Math.max(0,Math.min(1,((fv??0)-50)/50)), c1(fv));
+  setTrig("t3","tb3","tv3", t.gap, edge==null?0:Math.max(0,Math.min(1,edge/thE)), edge==null?"—":edge.toFixed(1)+"¢");
+  setTrig("tA","tbA","tvA", t.all, t.all?1:0, t.all?"FIRE":"wait");
+  $("th-j").textContent = jj; $("th-f").textContent = ff; $("th-e").textContent = thE;
+
+  // book
+  renderBook(s.pm?.asks ?? [], s.pm?.bids ?? []);
+
+  // latency + stats
+  const L = s.latency ?? {};
+  $("l-fp50").textContent = (L.feedP50 ?? 0).toFixed(0)+"ms";
+  $("l-fp99").textContent = (L.feedP99 ?? 0).toFixed(0)+"ms";
+  $("l-dp50").textContent = us(L.decisionUsP50);
+  $("l-dp99").textContent = us(L.decisionUsP99);
+  $("l-tp50").textContent = us(L.engineUsP50);
+  $("l-tp99").textContent = us(L.engineUsP99);
+  $("l-note").textContent = `hot path: ws-frame → fv → trigger → fill-walk (inline, zero hops) · feed lag from aggTrade T`;
+
+  $("s-trg").textContent = p.triggersToday ?? 0;
+  $("s-trd").textContent = p.trades ?? 0;
+  $("s-stk").textContent = "$"+fmt(p.stakedUsd, 0);
+  $("s-edg").textContent = c1(p.avgEdgeC);
+  $("s-re").textContent = pnl(p.pnlRealized);
+  $("s-un").textContent = pnl(p.pnlUnrealized);
+
+  drawCharts();
+}
+
+function setTrig(led, bar, val, on, frac, txt) {
+  $(led).className = "led" + (on ? " on" : "");
+  $(bar).style.width = (frac*100).toFixed(0)+"%";
+  $(val).textContent = txt;
+}
+
+function renderBook(asks, bids) {
+  let h = '<div class="lv">';
+  h += '<div>' + bids.map(l => `<span style="background:rgba(52,211,153,.07)"><b class="em">${l.p.toFixed(1)}</b><span>${Math.round(l.s)}</span></span>`).join("") + '</div>';
+  h += '<div>' + asks.map(l => `<span style="background:rgba(248,113,113,.07)"><b class="rd">${l.p.toFixed(1)}</b><span>${Math.round(l.s)}</span></span>`).join("") + "</div>";
+  h += "</div>";
+  $("book").innerHTML = h;
+}
+
+function renderSignals(list) { $("sig").innerHTML = list.map(sigRow).join(""); }
+function pushSignal(m) {
+  const tb = $("sig"); tb.insertAdjacentHTML("afterbegin", sigRow(m));
+  while (tb.rows.length > 60) tb.deleteRow(-1);
+}
+function sigRow(s) {
+  const cls = s.action==="EXECUTED" ? "em" : s.action==="WATCH" ? "am" : "";
+  return `<tr><td>${clock(s.ts)}</td><td class="${cls}">${s.action}</td><td class="mono-num">${(s.fv??0).toFixed(1)}</td><td class="num mono-num">${s.ask!=null?s.ask.toFixed(1):"—"}</td><td class="num mono-num">${s.edge!=null?s.edge.toFixed(1):"—"}</td><td class="num mono-num">${(s.jump5s??0).toFixed(1)}</td><td class="num mono-num">${Math.round(s.secondsLeft??0)}s</td><td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.reason||""}</td></tr>`;
+}
+
+function renderTrades(list) { $("trd").innerHTML = list.map(trdRow).join(""); }
+function settleTrade(m) {
+  for (const row of $("trd").rows) if (row.dataset.id === m.id) { row.outerHTML = trdRow(m); return; }
+  $("trd").insertAdjacentHTML("afterbegin", trdRow(m));
+}
+function trdRow(t) {
+  const cls = t.status==="WON" ? "em" : t.status==="LOST" ? "rd" : "am";
+  return `<tr data-id="${t.id}"><td>${clock(t.ts)}</td><td>${t.id}</td><td class="num mono-num">${(t.priceC??0).toFixed(1)}</td><td class="num mono-num">${(t.shares??0).toFixed(0)}</td><td class="num mono-num">$${(t.costUsd??0).toFixed(2)}</td><td class="num mono-num">${(t.fvAtEntry??0).toFixed(1)}</td><td class="num mono-num">${(t.edgeAtEntry??0).toFixed(1)}</td><td class="${cls}">${t.status}</td><td class="num mono-num ${cls}">${pnl(t.pnlUsd)}</td></tr>`;
+}
+
+// ── charts ───────────────────────────────────────────────────────────────
+function dpr(cv) { const r = window.devicePixelRatio||1, w = cv.clientWidth, h = cv.clientHeight; cv.width=w*r; cv.height=h*r; return cv.getContext("2d"); }
+function frame(ctx, w, h) { ctx.clearRect(0,0,w,h); }
+
+function drawCharts() {
+  drawPx(); drawFv();
+}
+
+function drawPx() {
+  const cv = $("c-px"); const ctx = dpr(cv); const w = cv.width, h = cv.height;
+  frame(ctx, w, h);
+  const pts = chart.slice(-240); if (pts.length < 2) return;
+  let lo = Infinity, hi = -Infinity;
+  for (const p of pts) { lo = Math.min(lo, p.price); hi = Math.max(hi, p.price); }
+  const k = (snap?.window?.strike) ?? null;
+  if (k) { lo = Math.min(lo, k); hi = Math.max(hi, k); }
+  if (hi - lo < 1) { hi += .5; lo -= .5; }
+  const X = (i) => 6 + (i/(pts.length-1))*(w-12);
+  const Y = (v) => h-8 - ((v-lo)/(hi-lo))*(h-16);
+  ctx.strokeStyle = "rgba(83,94,108,.35)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, Y(k)); ctx.lineTo(w, Y(k)); ctx.stroke();
+  ctx.strokeStyle = "#34d399"; ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  pts.forEach((p, i) => i ? ctx.lineTo(X(i), Y(p.price)) : ctx.moveTo(X(i), Y(p.price)));
+  ctx.stroke();
+  const last = pts[pts.length-1];
+  ctx.fillStyle = "#34d399"; ctx.beginPath(); ctx.arc(X(pts.length-1), Y(last.price), 2.5, 0, 7); ctx.fill();
+  ctx.fillStyle = "rgba(83,94,108,.9)"; ctx.font = "10px ui-monospace";
+  ctx.fillText(fmt(hi,1), 6, 12); ctx.fillText(fmt(lo,1), 6, h-4);
+  ctx.fillStyle = "rgba(251,191,36,.8)"; ctx.fillText("K "+fmt(k,1), w-90, Y(k)-4);
+}
+
+function drawFv() {
+  const cv = $("c-fv"); const ctx = dpr(cv); const w = cv.width, h = cv.height;
+  frame(ctx, w, h);
+  const pts = chart.slice(-240); if (pts.length < 2) return;
+  let lo = 100, hi = 0;
+  for (const p of pts) { lo = Math.min(lo, p.fv, p.pmAsk||100); hi = Math.max(hi, p.fv, p.pmAsk||0); }
+  lo = Math.max(0, lo-3); hi = Math.min(100, hi+3); if (hi-lo < 5) { hi+=3; lo-=2; }
+  const X = (i) => 6 + (i/(pts.length-1))*(w-12);
+  const Y = (v) => h-8 - ((v-lo)/(hi-lo))*(h-16);
+  // edge shading
+  ctx.fillStyle = "rgba(52,211,153,.10)";
+  ctx.beginPath();
+  let started = false;
+  pts.forEach((p, i) => { const x = X(i), y = Y(p.fv); const ya = Y(p.pmAsk||p.fv);
+    if (!started) { ctx.moveTo(x, y); started = true; }
+    ctx.lineTo(x, ya < y ? ya : y);
+  });
+  for (let i = pts.length-1; i >= 0; i--) ctx.lineTo(X(i), Y(pts[i].pmAsk||pts[i].fv));
+  ctx.closePath(); ctx.fill();
+  // fv line
+  ctx.strokeStyle = "#34d399"; ctx.lineWidth = 1.6;
+  ctx.beginPath(); pts.forEach((p,i) => i?ctx.lineTo(X(i),Y(p.fv)):ctx.moveTo(X(i),Y(p.fv))); ctx.stroke();
+  // pm ask
+  ctx.strokeStyle = "#fbbf24"; ctx.lineWidth = 1.3;
+  ctx.beginPath(); pts.forEach((p,i) => i?ctx.lineTo(X(i),Y(p.pmAsk||p.fv)):ctx.moveTo(X(i),Y(p.pmAsk||p.fv))); ctx.stroke();
+  ctx.fillStyle = "rgba(83,94,108,.9)"; ctx.font = "10px ui-monospace";
+  ctx.fillText(hi.toFixed(0)+"¢", 6, 12); ctx.fillText(lo.toFixed(0)+"¢", 6, h-4);
+}
+
+// ── controls ─────────────────────────────────────────────────────────────
+$("btn-start").onclick = () => send({type:"start"});
+$("btn-stop").onclick = () => send({type:"stop"});
+$("btn-reset").onclick = () => { if (confirm("Reset stats, trades and signals?")) send({type:"reset"}); };
+
+let deb = null;
+function setting(patch) {
+  clearTimeout(deb);
+  deb = setTimeout(() => send({type:"settings", settings: patch}), 250);
+}
+function bindRange(id, key, digits=0) {
+  $(id).oninput = () => { $(id+"-v").textContent = $(id).value; setting({[key]: +$(id).value}); };
+}
+bindRange("set-jump", "jumpThreshC");
+bindRange("set-floor", "fvFloorC");
+bindRange("set-edge", "edgeThreshC");
+bindRange("set-secs", "minSecsLeft");
+bindRange("set-max", "maxTradesPerWindow");
+bindRange("set-fee", "takerFeeBps");
+bindRange("set-age", "maxBookAgeMs");
+$("set-model").onchange = () => setting({model: $("set-model").value});
+$("set-auto").onchange = () => setting({autoTrade: $("set-auto").checked});
+$("set-stake").onchange = () => setting({stakeUsd: +$("set-stake").value});
+
+function applySettings(s) {
+  if (s.model) $("set-model").value = s.model;
+  if (s.autoTrade != null) $("set-auto").checked = !!s.autoTrade;
+  if (s.stakeUsd != null) $("set-stake").value = s.stakeUsd;
+  const map = {jumpThreshC:"set-jump", fvFloorC:"set-floor", edgeThreshC:"set-edge", minSecsLeft:"set-secs", maxTradesPerWindow:"set-max", takerFeeBps:"set-fee", maxBookAgeMs:"set-age"};
+  for (const [k,id] of Object.entries(map)) {
+    if (s[k] != null) { $(id).value = s[k]; const lab = $(id+"-v"); if (lab) lab.textContent = s[k]; }
+  }
+}
+
+(function loop() { render(); requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>

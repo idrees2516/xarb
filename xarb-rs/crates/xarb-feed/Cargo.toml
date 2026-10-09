@@ -1,0 +1,13 @@
+[package]
+name = "xarb-feed"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+xarb-core = { path = "../xarb-core" }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

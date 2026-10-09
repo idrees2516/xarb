@@ -1,0 +1,17 @@
+[package]
+name = "xarb-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "xarb-server"
+path = "src/main.rs"
+
+[dependencies]
+xarb-core = { path = "../xarb-core" }
+xarb-engine = { path = "../xarb-engine" }
+xarb-poly = { path = "../xarb-poly" }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
