@@ -56,3 +56,27 @@ Stage Summary:
 - XARB terminal fully verified end-to-end: live feeds → fair value → triggers → paper fill (book-walking) → settlement → P&L, with live tunable parameters
 - Engine: mini-services/xarb-engine (bun, :3001) · UI: Next.js (:3000) · gateway: Caddy (:81)
 - Ready for preview; paper mode only — real execution requires user's Polymarket CLOB credentials
+
+---
+Task ID: 3
+Agent: main (Super Z)
+Task: ① Tune FV model to Normal CDF (honest deep-OTM pricing) ② deliver Rust core + real EIP-712 CLOB order-signing for local deployment
+
+Work Log:
+- FV tune (TS engine + UI): Normal CDF now the default model; σ-floor 15.5 pts/√s calibrated to the user's spec example (+130pts/T=120s → 77.8¢, +15pts → 53.5¢); snapshot gains sigmaEffPts/z; FV card shows z·σ_eff·slope; settings sheet reorders cdf-first
+- CRITICAL bug found via new Rust unit tests: A&S 7.1.26 normCdf had a double-`t` multiplier (Φ(1)=0.871 vs 0.841) — biased the CDF model up everywhere. Fixed in BOTH fairvalue.ts (TS) and xarb-core/src/fv.rs; engine restarted
+- Rust core (xarb-rs, 5-crate workspace):
+  - xarb-core: FV models (Linear/NormalCdf), BTreeMap CLOB book, 5s FV-jump ring, percentiles, 11 tests
+  - xarb-feed: Binance combined WS (bookTicker+aggTrade), 1s EWMA realized vol, REST degradation, feed-lag rings
+  - xarb-poly: gamma discovery (btc-updown-5m-{epoch}), CLOB WS (PING/PONG, dead-socket, socket roll, REST fallback), EIP-712 order signing (CTF Exchange domain, keccak/k256, EIP-2 low-s, recovery), ClobAuth L1 derive-key, L2 HMAC headers, marketable BUY builder (6-dec raw amounts)
+  - xarb-engine: event-driven hot path (inline decision, zero hops), guards, paper book-walking fills, live order router (spawned task), 5m window lifecycle (settle→discover→resubscribe), 10Hz snapshot broadcast
+  - xarb-server: axum on :3002, embedded web/dashboard.html (dark terminal: charts, trigger LEDs, book, signals, blotter, settings over plain WS)
+- rustup toolchain installed; cargo check → fixed 6 compile errors; cargo test → 17/17 pass; cargo build --release OK (8.4 MB binary)
+- Runtime verified: Binance WS live (8.5k ticks/min, 31 ms lag), CLOB WS live, window rollover + socket roll + auto-reconnect after protocol error all exercised; decision p50 0.5µs / p99 6.9µs
+- dashboard.html WS client forwards XTransformPort → Rust core also reachable through the preview gateway at /?XTransformPort=3002; VLM QA on screenshot: 4/4 checks clean
+- GitHub: repo created (private) idrees2516/xarb; secrets scrubbed (token not committed, upload/tests/.zskills internal dirs untracked); 3 commits pushed; remote URL token scrubbed
+
+Stage Summary:
+- Normal-CDF FV is the default everywhere with honest bounded tails; normCdf math bug fixed in both engines
+- Rust core delivered and RUNNING on :3002 (paper mode, live feeds, EIP-712 signing ready); local deployment = cp .env.example, set POLY_PRIVATE_KEY + XARB_MODE=live, cargo run --release
+- Full stack live: Next.js terminal (:3000) + TS engine (:3001) + Rust core (:3002) behind Caddy gateway (:81); repo pushed to github.com/idrees2516/xarb (private)
