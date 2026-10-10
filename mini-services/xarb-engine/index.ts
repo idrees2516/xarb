@@ -15,6 +15,7 @@ const PORT = 3001
 // bun process so it survives sandbox process reaping between tool calls.
 // No-op when the release binary is absent. Guarded on globalThis so bun --hot
 // reloads never double-spawn; a stale pid file kills the previous instance.
+// v0.3: child exit auto-respawns with backoff (binary crashes self-heal).
 const g = globalThis as any
 if (!g.__xarbRsSupervisor) {
   g.__xarbRsSupervisor = true
@@ -25,21 +26,32 @@ if (!g.__xarbRsSupervisor) {
       const stale = Number(readFileSync(PIDFILE, 'utf8').trim())
       if (stale > 0) process.kill(stale, 'SIGTERM')
     } catch { /* no stale instance */ }
-    setTimeout(() => {
-      try {
-        const child = spawn(BIN, [], {
-          env: { ...process.env, XARB_PORT: '3002' },
-          stdio: ['ignore', 'pipe', 'pipe'],
-        })
-        writeFileSync(PIDFILE, String(child.pid))
-        child.stdout?.on('data', (d) => console.log('[xarb-rs]', String(d).trim()))
-        child.stderr?.on('data', (d) => console.error('[xarb-rs]', String(d).trim()))
-        child.on('exit', (code) => console.log(`[xarb-rs] exited (${code})`))
-        console.log(`[supervisor] xarb-rs spawned pid=${child.pid} on :3002`)
-      } catch (e) {
-        console.log('[supervisor] xarb-rs spawn failed:', String(e))
-      }
-    }, 1000)
+
+    let crashes = 0
+    const spawnRs = (delayMs: number) => {
+      setTimeout(() => {
+        try {
+          const child = spawn(BIN, [], {
+            env: { ...process.env, XARB_PORT: '3002' },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
+          writeFileSync(PIDFILE, String(child.pid))
+          child.stdout?.on('data', (d) => console.log('[xarb-rs]', String(d).trim()))
+          child.stderr?.on('data', (d) => console.error('[xarb-rs]', String(d).trim()))
+          child.on('exit', (code) => {
+            crashes++
+            const backoff = Math.min(1000 * 2 ** crashes, 30_000)
+            console.log(`[xarb-rs] exited (${code}) — respawn in ${backoff}ms (crash #${crashes})`)
+            spawnRs(backoff)
+          })
+          crashes = 0
+          console.log(`[supervisor] xarb-rs spawned pid=${child.pid} on :3002`)
+        } catch (e) {
+          console.log('[supervisor] xarb-rs spawn failed:', String(e))
+        }
+      }, delayMs)
+    }
+    spawnRs(1000)
   } else {
     console.log('[supervisor] xarb-rs release binary not found — TS engine only')
   }
