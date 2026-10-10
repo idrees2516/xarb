@@ -1,6 +1,18 @@
-//! Engine state types.
+//! Engine state types: settings, window, risk atomics, signals, trades.
 
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64};
+use std::sync::Arc;
 use xarb_core::FvModel;
+use xarb_hft::LogHist;
+
+/// FvFull ArcSwap publish cadence (ms).
+pub const FV_PUSH_MS: u64 = 50;
+/// Signal cooldown between fires (ms).
+pub const SIGNAL_COOLDOWN_MS: u64 = 5_000;
+/// Chart cadence (ms).
+pub const CHART_PUSH_MS: u64 = 250;
+/// Max chart points retained.
+pub const CHART_CAP: usize = 1440;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -14,6 +26,10 @@ pub struct Settings {
     pub model: FvModel,
     pub taker_fee_bps: f64,
     pub max_book_age_ms: u64,
+    /// Also trade the DOWN side (symmetric 3-condition trigger).
+    pub trade_down: bool,
+    /// Kill-switch: halt new fires when realized daily P&L ≤ −this (USD).
+    pub max_daily_loss_usd: f64,
 }
 
 impl Default for Settings {
@@ -29,6 +45,8 @@ impl Default for Settings {
             model: FvModel::NormalCdf,
             taker_fee_bps: 0.0,
             max_book_age_ms: 3000,
+            trade_down: true,
+            max_daily_loss_usd: 100.0,
         }
     }
 }
@@ -66,7 +84,13 @@ impl Settings {
             self.taker_fee_bps = x.clamp(0.0, 2000.0);
         }
         if let Some(x) = v["maxBookAgeMs"].as_u64() {
-            self.max_book_age_ms = x.clamp(100, 60_000);
+            self.max_book_age_ms = x.clamp(100, 30_000);
+        }
+        if let Some(x) = v["tradeDown"].as_bool() {
+            self.trade_down = x;
+        }
+        if let Some(x) = v["maxDailyLossUsd"].as_f64() {
+            self.max_daily_loss_usd = x.clamp(1.0, 1_000_000.0);
         }
     }
 
@@ -82,6 +106,8 @@ impl Settings {
             "model": self.model.as_str(),
             "takerFeeBps": self.taker_fee_bps,
             "maxBookAgeMs": self.max_book_age_ms,
+            "tradeDown": self.trade_down,
+            "maxDailyLossUsd": self.max_daily_loss_usd,
         })
     }
 }
@@ -93,6 +119,7 @@ pub struct Window {
     pub slug: String,
     pub question: String,
     pub up_token_id: String,
+    pub down_token_id: String,
     pub condition_id: String,
     pub strike: Option<f64>,
     pub strike_estimated: bool,
@@ -108,6 +135,7 @@ impl Window {
             slug: format!("btc-updown-5m-{epoch}"),
             question: String::new(),
             up_token_id: String::new(),
+            down_token_id: String::new(),
             condition_id: String::new(),
             strike: None,
             strike_estimated: true,
@@ -117,11 +145,164 @@ impl Window {
     }
 }
 
+/// Lock-free risk state — written by the executor/cold task (Relaxed),
+/// read by the strategy thread with single relaxed loads.
+pub struct RiskState {
+    /// Kill-switch (daily loss breach or manual).
+    pub kill: AtomicBool,
+    /// Guard epoch: window_trades is valid only for this window end (ms).
+    pub window_end_ms: AtomicU64,
+    /// Trades opened in the current window.
+    pub window_trades: AtomicU32,
+    /// Currently open positions.
+    pub open_trades: AtomicI32,
+    /// Realized daily P&L in cents.
+    pub daily_pnl_c: AtomicI64,
+}
+
+impl Default for RiskState {
+    fn default() -> Self {
+        RiskState {
+            kill: AtomicBool::new(false),
+            window_end_ms: AtomicU64::new(0),
+            window_trades: AtomicU32::new(0),
+            open_trades: AtomicI32::new(0),
+            daily_pnl_c: AtomicI64::new(0),
+        }
+    }
+}
+
+impl RiskState {
+    /// Trades in the current window (self-healing across window changes).
+    pub fn trades_in_window(&self, end_ms: u64) -> u32 {
+        let guard = self.window_end_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if guard != end_ms {
+            return 0;
+        }
+        self.window_trades.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reset_window(&self, end_ms: u64) {
+        self.window_trades.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.window_end_ms.store(end_ms, std::sync::atomic::Ordering::Relaxed);
+        self.open_trades.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn daily_pnl_usd(&self) -> f64 {
+        self.daily_pnl_c.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
+    }
+}
+
+/// Per-stage latency histograms (atomics inside — record from any thread).
+pub struct LatencyStats {
+    /// Feed: parse + ring push (ns).
+    pub parse: Arc<LogHist>,
+    /// FV thread: full recompute incl. fold + hot-word pack (ns).
+    pub fv: Arc<LogHist>,
+    /// Strategy: hot-word change → observed (ns).
+    pub detect: Arc<LogHist>,
+    /// Strategy: observed → FireIntent pushed (ns).
+    pub decide: Arc<LogHist>,
+    /// Executor: intent → fill applied / order built (ns).
+    pub fire: Arc<LogHist>,
+    /// Binance event-time lag (ms × 1e6 into the ns hist).
+    pub feed_lag: Arc<LogHist>,
+    /// Strategy spin iterations (for the Hz display).
+    pub spin_iters: AtomicU64,
+}
+
+impl Default for LatencyStats {
+    fn default() -> Self {
+        LatencyStats {
+            parse: Arc::new(LogHist::default()),
+            fv: Arc::new(LogHist::default()),
+            detect: Arc::new(LogHist::default()),
+            decide: Arc::new(LogHist::default()),
+            fire: Arc::new(LogHist::default()),
+            feed_lag: Arc::new(LogHist::default()),
+            spin_iters: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Side marker shared by signals and trades.
+pub const SIDE_UP: u8 = 0;
+pub const SIDE_DOWN: u8 = 1;
+
+pub fn side_str(s: u8) -> &'static str {
+    if s == SIDE_DOWN {
+        "DOWN"
+    } else {
+        "UP"
+    }
+}
+
+/// Skip/watch reason codes (compact — formatted on the cold task).
+pub const R_AUTO_OFF: u8 = 0;
+pub const R_TOO_CLOSE: u8 = 1;
+pub const R_COOLDOWN: u8 = 2;
+pub const R_MAX_TRADES: u8 = 3;
+pub const R_POS_OPEN: u8 = 4;
+pub const R_NO_TOKENS: u8 = 5;
+pub const R_THIN_BOOK: u8 = 6;
+pub const R_REPRICED: u8 = 7;
+pub const R_WATCH: u8 = 8;
+pub const R_STALE: u8 = 9;
+pub const R_LIVE_ERR: u8 = 10;
+pub const R_KILL: u8 = 11;
+
+/// Compact hot-path signal event — `Copy`, formatted off-path.
+#[derive(Debug, Clone, Copy)]
+pub struct SignalEvt {
+    pub kind: u8, // 0 WATCH · 1 SKIP · 2 FIRE
+    pub side: u8,
+    pub reason: u8,
+    pub ts_ms: u64,
+    pub window_end: u64,
+    pub fv: f64,
+    pub ask: f64,
+    pub jump: f64,
+    pub edge: f64,
+    pub t_sec: f64,
+}
+
+/// Fire intent crossing the strategy → executor SPSC ring. `Copy`.
+#[derive(Debug, Clone, Copy)]
+pub struct FireIntent {
+    pub t_mono_ns: u64,
+    pub ts_ms: u64,
+    pub side: u8,
+    pub fv: f64,
+    pub ask: f64,
+    pub jump: f64,
+    pub edge: f64,
+    pub t_sec: f64,
+    pub strike: f64,
+    pub window_end: u64,
+    pub stake_usd: f64,
+    pub fee_bps: f64,
+}
+
+/// Fill result from the executor → cold task (owns strings, cold path).
+#[derive(Debug, Clone)]
+pub struct FillEvent {
+    pub intent: FireIntent,
+    pub outcome: u8, // 0 filled · 1 skipped · 2 live error
+    pub reason: u8,
+    pub fill_price_c: Option<f64>,
+    pub shares: f64,
+    pub cost_usd: f64,
+    pub fee_usd: f64,
+    pub order_id: String,
+    pub order_status: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SignalLog {
     pub id: String,
     pub ts: u64,
     pub window_end: u64,
+    pub side: &'static str,
     pub fv: f64,
     pub ask: Option<f64>,
     pub edge: Option<f64>,
@@ -140,6 +321,7 @@ impl SignalLog {
             "id": self.id,
             "ts": self.ts,
             "windowEnd": self.window_end,
+            "side": self.side,
             "fv": round1(self.fv),
             "ask": self.ask.map(round1),
             "edge": self.edge.map(round1),
@@ -160,6 +342,7 @@ pub struct Trade {
     pub signal_id: String,
     pub ts: u64,
     pub window_end: u64,
+    pub side: u8,
     pub strike: f64,
     pub price_c: f64,
     pub shares: f64,
@@ -179,6 +362,7 @@ impl Trade {
             "signalId": self.signal_id,
             "ts": self.ts,
             "windowEnd": self.window_end,
+            "side": side_str(self.side),
             "strike": self.strike,
             "priceC": round1(self.price_c),
             "shares": round2(self.shares),
@@ -204,6 +388,8 @@ pub struct Stats {
     pub edge_n: u64,
     pub triggers_today: u64,
     pub day_start: u64,
+    /// Near-miss watch events logged today.
+    pub watches_today: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +402,10 @@ pub struct ChartPoint {
     pub pm_ask: f64,
     pub pm_bid: f64,
     pub edge: f64,
+    /// DOWN-side FV (100−fv for the CDF model).
+    pub fv_down: f64,
+    pub pm_ask_down: f64,
+    pub edge_down: f64,
 }
 
 /// Engine deployment configuration (from env).
@@ -235,7 +425,6 @@ pub fn round2(x: f64) -> f64 {
 
 /// Local midnight (epoch ms).
 pub fn local_midnight() -> u64 {
-    // UTC-agnostic day boundary on wall clock of the host
     let now = xarb_core::now_ms();
     now - (now % 86_400_000)
 }

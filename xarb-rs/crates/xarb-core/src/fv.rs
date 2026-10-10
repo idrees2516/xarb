@@ -70,7 +70,15 @@ pub fn fv(s: f64, k: f64, t_sec: f64, sigma_pts: f64, model: FvModel) -> FvOut {
 
 /// Abramowitz & Stegun 7.1.26 normal CDF (|err| < 7.5e-8).
 /// Q(x) = φ(x)·t·(b1 + b2·t + b3·t² + b4·t³ + b5·t⁴), t = 1/(1+0.2316419·|x|).
+/// |z| ≥ 8 saturates (Φ < 1e-15) — skips the exp/poly work on deep tails.
+#[inline]
 pub fn norm_cdf(z: f64) -> f64 {
+    if z > 8.0 {
+        return 1.0;
+    }
+    if z < -8.0 {
+        return 0.0;
+    }
     let t = 1.0 / (1.0 + 0.231_641_9 * z.abs());
     let d = 0.398_942_280_401_432_7 * (-z * z / 2.0).exp();
     let p = d

@@ -1,0 +1,9 @@
+[package]
+name = "xarb-hft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lock-free HFT kernel: SPSC rings, hot-word atomics, log histograms, CPU affinity, adaptive park"
+
+[dependencies]
+libc = "0.2"

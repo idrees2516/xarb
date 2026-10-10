@@ -9,6 +9,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1802,13 +1811,14 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xarb-core"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "xarb-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "hex",
  "rand 0.8.8",
  "reqwest",
@@ -1816,12 +1826,13 @@ dependencies = [
  "tokio",
  "xarb-core",
  "xarb-feed",
+ "xarb-hft",
  "xarb-poly",
 ]
 
 [[package]]
 name = "xarb-feed"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1830,13 +1841,22 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.23.1",
  "xarb-core",
+ "xarb-hft",
+]
+
+[[package]]
+name = "xarb-hft"
+version = "0.3.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
 name = "xarb-poly"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "futures-util",
  "hex",
  "hmac",
@@ -1849,11 +1869,12 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.23.1",
  "xarb-core",
+ "xarb-hft",
 ]
 
 [[package]]
 name = "xarb-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1861,6 +1882,7 @@ dependencies = [
  "tokio",
  "xarb-core",
  "xarb-engine",
+ "xarb-hft",
  "xarb-poly",
 ]
 

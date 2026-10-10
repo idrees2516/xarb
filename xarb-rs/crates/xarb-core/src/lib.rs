@@ -8,19 +8,22 @@
 //!              (+130 pts, T=120 → 77.8¢ ✓ · +15 pts → 53.5¢ ≈ 55¢)
 
 pub mod book;
+pub mod coarse;
 pub mod fv;
 pub mod stats;
 pub mod trigger;
 pub mod types;
 
 pub use book::Book;
+pub use coarse::{mono_ns, now_ms, start_coarse_clock};
 pub use fv::{fv, sigma_eff, FvModel, FvOut, SIGMA_CAP_PTS, SIGMA_FLOOR_PTS};
 pub use stats::{percentile, FvRing, Ring};
 pub use trigger::Trig;
 pub use types::{Level, Side};
 
-/// Unix time in milliseconds.
-pub fn now_ms() -> u64 {
+/// Unix time in milliseconds — coarse-clock fast path (see `coarse`).
+#[inline]
+pub fn legacy_wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

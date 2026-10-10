@@ -3,10 +3,13 @@
 //!   GET  /              embedded dashboard (web/dashboard.html)
 //!   GET  /ws            live stream: init → 10Hz snapshots, signals, settles;
 //!                       inbound control: start/stop/reset/settings
-//!   GET  /api/snapshot  one-shot JSON snapshot
+//!   GET  /api/snapshot  one-shot JSON snapshot (wait-free ArcSwap read)
 //!   POST /api/control   {"type":"start"|"stop"|"reset"|"settings","settings":{…}}
 //!
 //! Local deployment:  MODE=paper cargo run --release   (default :3002)
+//!
+//! v0.3: boots the pinned hot-path topology — FV engine, strategy and
+//! executor run on dedicated OS threads (see xarb-engine docs).
 
 use anyhow::{bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -16,7 +19,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use xarb_engine::{Engine, EngineConfig};
+use xarb_engine::{Engine, EngineConfig, PinPlan};
+use xarb_hft::SpinMode;
 use xarb_poly::{ClobClient, Creds};
 
 struct AppState {
@@ -32,7 +36,19 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3002);
 
-    // ── CLOB client (paper vs live EIP-712 signing) ─────────────────────────
+    // ── topology (spin policy + core pinning) ────────────────────────────
+    let cores = xarb_hft::affinity::core_count();
+    let spin_mode = std::env::var("XARB_SPINMODE")
+        .ok()
+        .and_then(|s| SpinMode::from_str(&s))
+        .unwrap_or_else(|| SpinMode::auto(cores));
+    let pins = PinPlan::for_cores(cores);
+    println!(
+        "[boot] topology: {cores} cores · spin {spin_mode:?} · pins(fv={:?} strat={:?} exec={:?} feed={:?} pm={:?})",
+        pins.fv, pins.strat, pins.exec, pins.feed, pins.pm
+    );
+
+    // ── CLOB client (paper vs live EIP-712 signing) ─────────────────────
     let (clob, cfg): (ClobClient, EngineConfig) = match mode.as_str() {
         "live" => {
             let confirm = std::env::var("XARB_LIVE_CONFIRM").unwrap_or_default();
@@ -56,7 +72,10 @@ async fn main() -> Result<()> {
             println!("[boot] live mode — wallet {}", c.address_hex());
             c.ensure_creds().await?;
             let ok = c.verify_auth().await.unwrap_or(false);
-            println!("[boot] L2 auth verify: {}", if ok { "OK" } else { "FAILED (orders will error)" });
+            println!(
+                "[boot] L2 auth verify: {}",
+                if ok { "OK" } else { "FAILED (orders will error)" }
+            );
             (c, EngineConfig { mode: "live", neg_risk: env_flag("XARB_NEG_RISK") })
         }
         _ => (ClobClient::paper(), EngineConfig { mode: "paper", neg_risk: false }),
@@ -65,9 +84,7 @@ async fn main() -> Result<()> {
     // ── engine ─────────────────────────────────────────────────────────────
     let (out_tx, _): (broadcast::Sender<String>, broadcast::Receiver<String>) =
         broadcast::channel(2048);
-    let mode_label = cfg.mode;
-    let neg_risk = cfg.neg_risk;
-    let engine = Engine::new(cfg, clob, out_tx);
+    let engine = Engine::new(cfg, clob, out_tx, spin_mode, pins);
     apply_env_settings(&engine);
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
     engine.start(ctrl_rx);
@@ -87,7 +104,11 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .with_context(|| format!("bind :{port}"))?;
-    println!("[boot] XARB rust core — {} mode — http://127.0.0.1:{port}{}", mode_label, if neg_risk { " (neg-risk)" } else { "" });
+    println!(
+        "[boot] XARB rust core v0.3 — {} mode — http://127.0.0.1:{port}{}",
+        engine.cfg.mode,
+        if engine.cfg.neg_risk { " (neg-risk)" } else { "" }
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -130,8 +151,14 @@ fn apply_env_settings(engine: &Arc<Engine>) {
     if let Ok(v) = std::env::var("XARB_AUTO_TRADE") {
         j["autoTrade"] = serde_json::json!(v != "0" && !v.eq_ignore_ascii_case("false"));
     }
+    if let Ok(v) = std::env::var("XARB_TRADE_DOWN") {
+        j["tradeDown"] = serde_json::json!(v != "0" && !v.eq_ignore_ascii_case("false"));
+    }
+    if let Some(v) = env_num("XARB_MAX_DAILY_LOSS") {
+        j["maxDailyLossUsd"] = serde_json::json!(v);
+    }
     if j.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
-        engine.settings.lock().unwrap().patch(&j);
+        engine.apply_settings(&j);
         println!("[boot] env settings: {j}");
     }
 }
@@ -140,8 +167,14 @@ async fn root() -> Html<&'static str> {
     Html(include_str!("../../../web/dashboard.html"))
 }
 
-async fn api_snapshot(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(xarb_engine::snapshot::build(&st.engine))
+/// Wait-free: the cold task prebuilds the 10Hz JSON, readers just load it.
+async fn api_snapshot(State(st): State<Arc<AppState>>) -> Response {
+    let body = st.engine.snap.load_full();
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.as_str().to_owned(),
+    )
+        .into_response()
 }
 
 async fn api_control(
@@ -157,9 +190,15 @@ async fn ws_handler(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> Re
 }
 
 async fn handle_socket(mut socket: WebSocket, st: Arc<AppState>) {
-    // initial state: full snapshot + history + logs + settings
-    let init = xarb_engine::snapshot::build_init(&st.engine);
-    if socket.send(Message::Text(init.to_string())).await.is_err() {
+    // initial state: prebuilt init JSON (1Hz refresh by the cold task)
+    let init = st.engine.init_snap.load_full();
+    if init.is_empty() {
+        // cold task hasn't produced one yet — build synchronously
+        let v = xarb_engine::snapshot::build_init(&st.engine);
+        if socket.send(Message::Text(v.to_string())).await.is_err() {
+            return;
+        }
+    } else if socket.send(Message::Text(init.as_str().to_owned())).await.is_err() {
         return;
     }
     let mut rx = st.engine.out_tx.subscribe();

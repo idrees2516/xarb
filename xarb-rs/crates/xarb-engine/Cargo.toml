@@ -5,8 +5,10 @@ edition.workspace = true
 
 [dependencies]
 xarb-core = { path = "../xarb-core" }
+xarb-hft = { path = "../xarb-hft" }
 xarb-feed = { path = "../xarb-feed" }
 xarb-poly = { path = "../xarb-poly" }
+arc-swap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

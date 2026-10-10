@@ -1,55 +1,125 @@
-//! Engine orchestration: feeds → hot-path evaluation → paper/live execution
-//! → 10Hz snapshot broadcast. All cross-task state sits behind std Mutexes
-//! with tens-of-nanoseconds critical sections; the decision path runs inline
-//! on the feed event task with zero extra hops.
+//! xarb-engine v0.3 — the HFT core.
+//!
+//! Topology (one thread per stage, no shared locks on the decision path):
+//!
+//! ```text
+//!  Binance WS ──parse(~100ns)──► SPSC ring ──► FV engine thread ──► HotWord(u64)
+//!  (pinned, own runtime)        (wait-free)   (pinned, spin/eco)  │ Release store
+//!  PM CLOB WS ──book──► QuoteCells(u64) ──fold─┘                  ▼
+//!  (pinned, dual-token)                              Strategy thread (pinned)
+//!                                                     1 load + 2 AND + 2 cmp
+//!                                                              │ FireIntent (Copy)
+//!                                                              ▼ SPSC ring
+//!                                                     Executor thread (pinned)
+//!                                                   paper ladder-walk / EIP-712 FOK
+//!                                                              │ FillEvent
+//!                                                              ▼
+//!  Cold task (10Hz snapshots, signals, stats, window lifecycle, control)
+//!  ── ArcSwap<String> / broadcast ──► axum WS + HTTP (wait-free reads)
+//! ```
+//!
+//! Every trigger condition is evaluated on EVERY opportunity: the strategy
+//! thread re-checks the full 3-condition conjunction (both sides) at spin
+//! cadence — no event queue, no coalescing, no missed windows.
 
-pub mod fire;
-pub mod hotpath;
+pub mod cold;
+pub mod executor;
+pub mod hotcore;
 pub mod snapshot;
 pub mod state;
+pub mod strategy;
 pub mod window;
 
-pub use state::{ChartPoint, EngineConfig, Settings, SignalLog, Stats, Trade, Window};
-
-use crate::state::local_midnight;
+pub use hotcore::{FvCore, FvFull, HotShared};
+pub use state::{
+    ChartPoint, EngineConfig, FillEvent, FireIntent, LatencyStats, RiskState, Settings,
+    SignalEvt, SignalLog, Stats, Trade, Window, SIDE_DOWN, SIDE_UP,
+};
+pub use window::ColdState;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc, watch};
-use xarb_core::{now_ms, FvRing, Ring, Trig};
-use xarb_feed::{spawn as spawn_binance, BinState, SharedBin};
-use xarb_poly::clob_ws::spawn as spawn_pm;
-use xarb_poly::{ClobClient, PmState, SharedPm};
+use tokio::sync::{broadcast, watch};
+use xarb_hft::{SpscRing, SpinMode, WakeSlot};
+use xarb_poly::ClobClient;
 
-pub const FV_PUSH_MS: u64 = 50;
-pub const FV_KEEP_MS: u64 = 20_000;
-pub const SIGNAL_COOLDOWN_MS: u64 = 5_000;
-pub const CHART_PUSH_MS: u64 = 250;
-pub const CHART_CAP: usize = 1440;
+/// Cross-thread wake bus (slots armed as handles spawn).
+pub struct WakeBus {
+    /// Feeds → FV engine.
+    pub fv: Arc<WakeSlot>,
+    /// FV engine → strategy.
+    pub strat: Arc<WakeSlot>,
+    /// Strategy → executor.
+    pub exec: Arc<WakeSlot>,
+}
+
+/// CPU pin plan (None = leave to the scheduler).
+#[derive(Debug, Clone, Copy)]
+pub struct PinPlan {
+    pub feed: Option<usize>,
+    pub fv: Option<usize>,
+    pub strat: Option<usize>,
+    pub exec: Option<usize>,
+    pub pm: Option<usize>,
+}
+
+impl PinPlan {
+    /// Assign cores 1.. skipping core 0 (reserved for the runtime/kernel).
+    /// Feed gets the first core (network syscalls), then FV, strategy,
+    /// executor, PM. Fewer cores → later stages unpinned.
+    pub fn for_cores(n: usize) -> PinPlan {
+        let slots = [PinPlan { feed: Some(1), fv: Some(2), strat: Some(3), exec: Some(4), pm: Some(5) },
+                     PinPlan { feed: Some(1), fv: Some(2), strat: Some(3), exec: None, pm: Some(4) },
+                     PinPlan { feed: Some(1), fv: Some(2), strat: Some(3), exec: None, pm: None },
+                     PinPlan { feed: None, fv: Some(1), strat: Some(2), exec: None, pm: None },
+                     PinPlan { feed: None, fv: None, strat: Some(1), exec: None, pm: None }];
+        let idx = if n >= 6 {
+            0
+        } else {
+            (7 - n).min(4)
+        };
+        slots[idx]
+    }
+
+    pub fn any(&self) -> bool {
+        self.feed.is_some() || self.fv.is_some() || self.strat.is_some()
+    }
+}
+
+struct Channels {
+    signal: tokio::sync::mpsc::UnboundedSender<SignalEvt>,
+    fill: tokio::sync::mpsc::UnboundedSender<FillEvent>,
+}
 
 pub struct Engine {
     pub cfg: EngineConfig,
-    pub bin: SharedBin,
-    pub pm: SharedPm,
-    pub window: Arc<Mutex<Window>>,
-    pub settings: Arc<Mutex<Settings>>,
-    pub stats: Arc<Mutex<Stats>>,
-    pub signals: Arc<Mutex<Vec<SignalLog>>>,
-    pub trades: Arc<Mutex<Vec<Trade>>>,
-    pub chart: Arc<Mutex<Vec<ChartPoint>>>,
-    pub fv_ring: Arc<Mutex<FvRing>>,
-    pub trig: Arc<Mutex<Trig>>,
-    pub last_fv: Arc<Mutex<f64>>,
+    // hot path
+    pub hot: Arc<HotShared>,
+    pub feeds: Arc<xarb_feed::FeedOut>,
+    pub feeds_ring: Arc<SpscRing<xarb_feed::Ev>>,
+    pub pm: Arc<xarb_poly::PmOut>,
+    pub fire_ring: Arc<SpscRing<FireIntent>>,
+    pub wake: WakeBus,
+    // shared config/state
+    pub cold: Arc<Mutex<ColdState>>,
+    pub settings: Arc<arc_swap::ArcSwap<Settings>>,
+    pub settings_gen: Arc<AtomicU64>,
+    pub risk: Arc<RiskState>,
+    pub lat: Arc<LatencyStats>,
     pub running: Arc<AtomicBool>,
-    pub last_signal_ts: Arc<AtomicU64>,
-    pub decision_us: Arc<Mutex<Ring>>,
-    pub tick_us: Arc<Mutex<Ring>>,
-    pub feed_lag: Arc<Mutex<Ring>>,
-    pub signal_seq: Arc<AtomicU64>,
-    pub token_tx: watch::Sender<Option<String>>,
+    // io / external
+    pub token_tx: watch::Sender<Option<(String, String)>>,
     pub clob: Arc<tokio::sync::Mutex<ClobClient>>,
-    pub out_tx: broadcast::Sender<String>,
     pub http: Arc<reqwest::Client>,
+    pub out_tx: broadcast::Sender<String>,
+    pub snap: Arc<arc_swap::ArcSwap<String>>,
+    pub init_snap: Arc<arc_swap::ArcSwap<String>>,
+    // deployment
+    pub spin_mode: SpinMode,
+    pub pins: PinPlan,
+    pub boot_ms: AtomicU64,
+    pub ring_dropped: AtomicU64,
+    channels: Mutex<Option<Channels>>,
 }
 
 impl Engine {
@@ -57,135 +127,106 @@ impl Engine {
         cfg: EngineConfig,
         clob: ClobClient,
         out_tx: broadcast::Sender<String>,
+        spin_mode: SpinMode,
+        pins: PinPlan,
     ) -> Arc<Engine> {
-        let (token_tx, _rx) = watch::channel(None::<String>);
+        let (token_tx, _rx) = watch::channel(None::<(String, String)>);
         let http = Arc::new(
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(8))
                 .build()
                 .unwrap_or_default(),
         );
+        let ring = Arc::new(SpscRing::<xarb_feed::Ev>::with_capacity(xarb_feed::RING_CAP));
+        let fv_wake = Arc::new(WakeSlot::new());
+        let lat = Arc::new(LatencyStats::default());
+        let feeds = Arc::new(xarb_feed::FeedOut::new(
+            ring.clone(),
+            fv_wake.clone(),
+            lat.parse.clone(),
+        ));
+        let pm = Arc::new(xarb_poly::PmOut::new(fv_wake.clone()));
         Arc::new(Engine {
             cfg,
-            bin: Arc::new(Mutex::new(BinState::default())),
-            pm: Arc::new(Mutex::new(PmState::default())),
-            window: Arc::new(Mutex::new(Window::empty(0))),
-            settings: Arc::new(Mutex::new(Settings::default())),
-            stats: Arc::new(Mutex::new(Stats {
-                day_start: local_midnight(),
-                ..Stats::default()
-            })),
-            signals: Arc::new(Mutex::new(Vec::new())),
-            trades: Arc::new(Mutex::new(Vec::new())),
-            chart: Arc::new(Mutex::new(Vec::new())),
-            fv_ring: Arc::new(Mutex::new(FvRing::new(FV_KEEP_MS))),
-            trig: Arc::new(Mutex::new(Trig::default())),
-            last_fv: Arc::new(Mutex::new(50.0)),
+            hot: Arc::new(HotShared::new()),
+            feeds,
+            feeds_ring: ring,
+            pm,
+            fire_ring: Arc::new(SpscRing::<FireIntent>::with_capacity(
+                strategy::FIRE_RING_CAP,
+            )),
+            wake: WakeBus {
+                fv: fv_wake,
+                strat: Arc::new(WakeSlot::new()),
+                exec: Arc::new(WakeSlot::new()),
+            },
+            cold: Arc::new(Mutex::new(ColdState::default())),
+            settings: Arc::new(arc_swap::ArcSwap::from_pointee(Settings::default())),
+            settings_gen: Arc::new(AtomicU64::new(1)),
+            risk: Arc::new(RiskState::default()),
+            lat,
             running: Arc::new(AtomicBool::new(true)),
-            last_signal_ts: Arc::new(AtomicU64::new(0)),
-            decision_us: Arc::new(Mutex::new(Ring::new(400))),
-            tick_us: Arc::new(Mutex::new(Ring::new(400))),
-            feed_lag: Arc::new(Mutex::new(Ring::new(400))),
-            signal_seq: Arc::new(AtomicU64::new(0)),
             token_tx,
             clob: Arc::new(tokio::sync::Mutex::new(clob)),
-            out_tx,
             http,
+            out_tx,
+            snap: Arc::new(arc_swap::ArcSwap::from_pointee(String::new())),
+            init_snap: Arc::new(arc_swap::ArcSwap::from_pointee(String::new())),
+            spin_mode,
+            pins,
+            boot_ms: AtomicU64::new(xarb_core::now_ms()),
+            ring_dropped: AtomicU64::new(0),
+            channels: Mutex::new(None),
         })
     }
 
-    /// Boot everything: feeds, hot path, tick loop, window manager, control.
-    pub fn start(self: &Arc<Self>, mut ctrl_rx: mpsc::UnboundedReceiver<serde_json::Value>) {
-        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<()>();
-
-        // initial window
-        let eng = self.clone();
-        tokio::spawn(async move {
-            let epoch = xarb_core::current_window_epoch(now_ms());
-            crate::window::manage_window(eng, epoch).await;
-        });
-
-        // feeds
-        spawn_binance(self.bin.clone(), ev_tx.clone());
-        {
-            let token_rx = self.token_tx.subscribe();
-            spawn_pm(self.pm.clone(), token_rx, ev_tx);
+    /// Boot the whole hot-path topology + cold task.
+    pub fn start(self: &Arc<Self>, ctrl_rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>) {
+        // start the coarse clock (1ns now_ms) on its own tiny thread
+        xarb_core::start_coarse_clock();
+        // best-effort realtime for the hot threads (no-op without CAP_SYS_NICE)
+        if self.pins.any() && xarb_hft::affinity::try_realtime() {
+            println!("[boot] SCHED_FIFO acquired for hot threads");
         }
-
-        // hot path
-        {
-            let eng = self.clone();
-            tokio::spawn(async move {
-                crate::hotpath::run(eng, ev_rx).await;
-            });
-        }
-
-        // 10Hz tick loop
-        {
-            let eng = self.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
-                loop {
-                    tick.tick().await;
-                    crate::window::tick(&eng).await;
-                }
-            });
-        }
-
-        // control
-        {
-            let eng = self.clone();
-            tokio::spawn(async move {
-                while let Some(msg) = ctrl_rx.recv().await {
-                    apply_control(&eng, &msg);
-                }
-            });
-        }
-
+        cold::spawn(self.clone(), ctrl_rx);
+        let mode = self.spin_mode;
         println!(
-            "[engine] started ({} mode, auto-trade {})",
+            "[engine] started ({} mode, auto-trade {}, spin {:?})",
             self.cfg.mode,
-            self.settings.lock().unwrap().auto_trade
+            self.settings.load_full().auto_trade,
+            mode
         );
     }
 
     /// Broadcast an outbound JSON message (ignoring absent receivers).
     pub fn emit(&self, v: serde_json::Value) {
-        let _ = self.out_tx.send(v.to_string());
+        let s = v.to_string();
+        self.snap.store(Arc::new(s.clone()));
+        let _ = self.out_tx.send(s);
     }
-}
 
-fn apply_control(eng: &Arc<Engine>, msg: &serde_json::Value) {
-    let kind = msg["type"].as_str().unwrap_or("");
-    match kind {
-        "start" => {
-            eng.running.store(true, Ordering::Relaxed);
-            println!("[engine] running=true");
-        }
-        "stop" => {
-            eng.running.store(false, Ordering::Relaxed);
-            println!("[engine] running=false");
-        }
-        "reset" => {
-            {
-                let mut signals = eng.signals.lock().unwrap();
-                signals.clear();
-                let mut trades = eng.trades.lock().unwrap();
-                trades.clear();
-                let mut stats = eng.stats.lock().unwrap();
-                *stats = Stats { day_start: local_midnight(), ..Stats::default() };
-                let mut chart = eng.chart.lock().unwrap();
-                chart.clear();
-            }
-            println!("[engine] stats reset");
-        }
-        "settings" => {
-            if let Some(s) = msg.get("settings") {
-                let mut st = eng.settings.lock().unwrap();
-                st.patch(s);
-                println!("[engine] settings updated: {s}");
-            }
-        }
-        _ => {}
+    /// Patch settings (dashboard control / env) — hot threads pick the
+    /// change up within one recompute (≤1ms).
+    pub fn apply_settings(&self, v: &serde_json::Value) {
+        let mut st = Settings::clone(self.settings.load_full().as_ref());
+        st.patch(v);
+        self.settings.store(Arc::new(st));
+        self.settings_gen.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn set_channels(
+        &self,
+        signal: tokio::sync::mpsc::UnboundedSender<SignalEvt>,
+        fill: tokio::sync::mpsc::UnboundedSender<FillEvent>,
+    ) {
+        *self.channels.lock().unwrap() = Some(Channels { signal, fill });
+    }
+
+    pub(crate) fn signal_tx_get(&self) -> tokio::sync::mpsc::UnboundedSender<SignalEvt> {
+        self.channels.lock().unwrap().as_ref().expect("channels set").signal.clone()
+    }
+
+    pub(crate) fn fill_tx_get(&self) -> tokio::sync::mpsc::UnboundedSender<FillEvent> {
+        self.channels.lock().unwrap().as_ref().expect("channels set").fill.clone()
     }
 }

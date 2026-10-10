@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 xarb-core = { path = "../xarb-core" }
+xarb-hft = { path = "../xarb-hft" }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

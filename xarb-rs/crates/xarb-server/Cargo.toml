@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 xarb-core = { path = "../xarb-core" }
+xarb-hft = { path = "../xarb-hft" }
 xarb-engine = { path = "../xarb-engine" }
 xarb-poly = { path = "../xarb-poly" }
 tokio = { workspace = true }

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/xarb-core",
+    "crates/xarb-hft",
     "crates/xarb-feed",
     "crates/xarb-poly",
     "crates/xarb-engine",
@@ -9,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 
@@ -28,7 +29,16 @@ sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
 anyhow = "1"
+libc = "0.2"
+arc-swap = "1"
+xarb-core = { path = "crates/xarb-core" }
+xarb-hft = { path = "crates/xarb-hft" }
+xarb-feed = { path = "crates/xarb-feed" }
+xarb-poly = { path = "crates/xarb-poly" }
+xarb-engine = { path = "crates/xarb-engine" }
 
 [profile.release]
 opt-level = 3
 debug = false
+codegen-units = 1
+lto = "thin"
