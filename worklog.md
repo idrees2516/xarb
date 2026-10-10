@@ -80,3 +80,32 @@ Stage Summary:
 - Normal-CDF FV is the default everywhere with honest bounded tails; normCdf math bug fixed in both engines
 - Rust core delivered and RUNNING on :3002 (paper mode, live feeds, EIP-712 signing ready); local deployment = cp .env.example, set POLY_PRIVATE_KEY + XARB_MODE=live, cargo run --release
 - Full stack live: Next.js terminal (:3000) + TS engine (:3001) + Rust core (:3002) behind Caddy gateway (:81); repo pushed to github.com/idrees2516/xarb (private)
+
+---
+Task ID: 4
+Agent: main (Super Z)
+Task: Session restart — verify xarb-rs integrity, re-validate EIP-712 against the official client, fix signing bugs, rebuild, re-push, restore live preview
+
+Work Log:
+- Sandbox reset wiped ~/.cargo, ~/.rustup and xarb-rs/target (rustup reinstalled; release rebuilt in 2m03s); repo intact with 1 unpushed commit (fed117a)
+- Shallow-cloned Polymarket/clob-client (TS) + ctf-exchange; verified signing constants field-by-field:
+  - ORDER_STRUCTURE = 12 fields ending `uint8 side, uint8 signatureType` — xarb-rs typehash was MISSING signatureType (orders could never verify on-chain) → FIXED
+  - ClobAuth L1: 3-field domain (name/version/chainId, NO verifyingContract), message "This message attests that I control the given wallet", GET /auth/derive-api-key → FIXED domain + message + verb/path
+  - L2 HMAC: URL-safe base64 with padding (was hex); POLY_PASSPHRASE = passphrase (was secret); base64url secret sanitization → FIXED
+  - POST /order payload: official shape {deferExec, order:{salt JSON number, big uints as strings, side "BUY"}, owner, orderType:"FOK"} → FIXED
+  - neg-risk exchange 0xC5d563A36AE78145C45a50134d48A1215220f80a CONFIRMED correct (matches official client config)
+- Live-probed the CLOB from sandbox: gamma slug pattern still live (btc-updown-5m-1791606700), tick = 0.01, **base_fee = 1000 bps (10% taker fee)** on the 5m BTC series
+- New ClobClient::tick_size()/fee_rate_bps() with 60s cache (public endpoints); post_buy_order resolves both and carries the exact market feeRateBps (mismatch = CLOB rejection); build_buy_order: tick-grid price CEIL (float-noise-safe: 0.56/0.01 = 56.000000000000005 → tolerance −1e-6), size floor 2dp, JSON-safe salt < 2^53
+- Engine: hotpath passes WS-observed market fee (PmState.fee_rate_bps) into try_fire, overriding the settings knob for honest paper P&L; takerFeeBps clamp 500→2000; removed dead PmState.last_alive_at + unused imports → build warning-free
+- New tests: signed_body_payload_shape (parses the exact REST JSON), tick-ceil rounding cases, base64url roundtrip, ClobAuth determinism → cargo test 19/19 green
+- Rust server dies when spawned from tool calls (sandbox reaps process trees). Fix: bun engine (platform-supervised, PID 1203) now supervises the xarb-server binary as its child (mini-services/xarb-engine/index.ts, globalThis guard + stale-pid kill, hot-reload safe) → Rust core survives across tool calls on :3002
+- Live verification: Binance WS 540 ticks/min (feed p50 29ms), window rollover btc-updown-5m-1791606600→…6900 worked (settle→discover→resubscribe), PM book age 12ms, FV 50–52¢ CDF ATM, decision latency p50 0.7µs / p99 4.4µs, no false triggers on negative edge
+- Hygiene: untracked .env (was tracked; only DATABASE_URL ever committed, history swept clean of tokens) + .zscripts/ platform scripts; .gitignore expanded (.env, target/, *.pid, db/, upload/, …)
+- Committed 312140f (10 files, +390/−93) and pushed to idrees2516/xarb (private) — verified via API; token used in push URL only, never stored
+- Packaged download/xarb-rs-v0.2.1-src.tar.gz (60KB, target excluded)
+
+Stage Summary:
+- EIP-712 order signing now matches the official clob-client byte-for-byte in scheme (12-field typehash, ClobAuth L1, base64url L2 HMAC, official POST shape, per-token tick+fee)
+- CRITICAL fee reality surfaced: 1000 bps taker fee on the 5m BTC series — README "Fee reality" section spells out the net-edge math; engine carries the live market fee on orders and in paper P&L
+- Full preview stack healthy: Next.js :3000 · TS engine :3001 · Rust core :3002 (bun-supervised, survives reaping) · Caddy :81 (?XTransformPort=3002 → Rust terminal)
+- Repo up to date at github.com/idrees2516/xarb (private, 5 commits); tests 19/19, release build warning-free
