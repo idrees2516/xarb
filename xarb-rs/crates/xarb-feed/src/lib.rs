@@ -6,7 +6,7 @@
 //! event timestamps give true feed latency; 1-second price sampling drives an
 //! EWMA realized-vol estimate in BTC points per √second.
 
-use anyhow::Result;
+
 use futures_util::{SinkExt, StreamExt};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

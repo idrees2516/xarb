@@ -1,9 +1,13 @@
 //! EIP-712 order signing for the Polymarket CLOB (CTF Exchange, Polygon 137).
 //!
-//! Faithful port of the reference `py-clob-client` signing scheme:
-//!   • L1 auth (POST /auth/derive-key): EIP-712 `ClobAuth` typed signature
+//! Faithful port of the official `clob-client` (TypeScript) signing scheme,
+//! cross-checked field-by-field against the reference implementation:
+//!   • L1 auth (GET /auth/derive-api-key): EIP-712 `ClobAuth` typed signature
+//!     over a 3-field domain (name, version, chainId — NO verifyingContract)
 //!   • Order signing: EIP-712 `Order` struct hash over the CTF Exchange domain
+//!     (12 fields, ending `uint8 side, uint8 signatureType`)
 //!   • L2 auth (private REST): HMAC-SHA256(api secret, ts+method+path+body)
+//!     encoded as URL-safe base64 with padding
 //!
 //! The EIP-712 digest is keccak256(0x1901 ‖ domainSeparator ‖ structHash) with
 //! every field ABI-encoded to exactly 32 bytes. No middleware libraries — the
@@ -20,10 +24,8 @@ pub const CTF_EXCHANGE: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 pub const NEG_RISK_CTF_EXCHANGE: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
 pub const CHAIN_ID: u64 = 137;
 
-const EIP191_PREFIX: [u8; 1] = [0x19];
-const EIP191_VERSION: [u8; 1] = [0x01];
-const CLOB_AUTH_MESSAGE: &str =
-    "This message attests that I grant this api key permission to use Polymarket on my behalf.\n\n";
+/// Fixed attestation signed for L1 derive-key (exact string from the official client).
+const CLOB_AUTH_MESSAGE: &str = "This message attests that I control the given wallet";
 
 // ── keccak + ABI primitives ─────────────────────────────────────────────────
 
@@ -165,11 +167,18 @@ pub fn address_of(sk: &SigningKey) -> [u8; 20] {
 // ── ClobAuth (L1): derive api key ───────────────────────────────────────────
 
 /// EIP-712 signature for `ClobAuth(address address,string timestamp,uint256 nonce,string message)`
-/// over domain `ClobAuthDomain/1` chain 137, address 0x0. Used by
-/// POST /auth/derive-key.
+/// over domain `ClobAuthDomain/1` chain 137 — the domain has ONLY (name,
+/// version, chainId), no verifyingContract (matches the official client).
+/// Used by GET /auth/derive-api-key.
 pub fn clob_auth_signature(sk: &SigningKey, timestamp_sec: u64, nonce: u64) -> Result<[u8; 65]> {
-    let zero = [0u8; 20];
-    let domain = domain_separator("ClobAuthDomain", "1", CHAIN_ID, &zero);
+    // EIP712Domain(string name,string version,uint256 chainId)
+    let domain_type = keccak256(b"EIP712Domain(string name,string version,uint256 chainId)");
+    let domain = keccak_concat(&[
+        &domain_type,
+        &keccak256(b"ClobAuthDomain"),
+        &keccak256(b"1"),
+        &u256(CHAIN_ID as u128),
+    ]);
     let type_hash =
         keccak256(b"ClobAuth(address address,string timestamp,uint256 nonce,string message)");
     let ts_bytes = format!("{timestamp_sec}");
@@ -201,14 +210,16 @@ pub struct RawOrder {
     pub fee_rate_bps: u128,
     /// 0 = BUY, 1 = SELL
     pub side: u8,
+    /// 0 = EOA, 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
+    pub signature_type: u8,
 }
 
 impl RawOrder {
-    /// EIP-712 struct hash:
-    /// `Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side)`
+    /// EIP-712 struct hash — 12 fields, exactly matching the exchange contract:
+    /// `Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)`
     pub fn struct_hash(&self) -> [u8; 32] {
         let type_hash = keccak256(
-            b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side)",
+            b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)",
         );
         keccak_concat(&[
             &type_hash,
@@ -223,6 +234,7 @@ impl RawOrder {
             &u256(self.nonce),
             &u256(self.fee_rate_bps),
             &u256(self.side as u128),
+            &u256(self.signature_type as u128),
         ])
     }
 
@@ -232,8 +244,17 @@ impl RawOrder {
         eip712_digest(&domain, &self.struct_hash())
     }
 
-    /// Sign and produce the CLOB POST /order JSON body.
-    pub fn signed_body(&self, sk: &SigningKey, neg_risk: bool) -> Result<String> {
+    /// Sign and produce the CLOB POST /order JSON body (official client shape):
+    /// `{"deferExec":false,"order":{…},"owner":<api key>,"orderType":<GTC|FOK|FAK>}`.
+    /// Salt is a JSON number (kept < 2^53); big uints are decimal strings;
+    /// `side` and `signatureType` mirror the REST enum encodings.
+    pub fn signed_body(
+        &self,
+        sk: &SigningKey,
+        neg_risk: bool,
+        owner_api_key: &str,
+        order_type: &str,
+    ) -> Result<String> {
         // NEG_RISK markets sign over the neg-risk exchange contract.
         let digest = if neg_risk {
             let domain = domain_separator(
@@ -248,7 +269,7 @@ impl RawOrder {
         };
         let sig = sign_digest(sk, &digest)?;
         let json = format!(
-            r#"{{"order":{{"salt":{},"maker":"0x{}","signer":"0x{}","taker":"0x{}","tokenId":"{}","makerAmount":"{}","takerAmount":"{}","expiration":"{}","nonce":"{}","feeRateBps":"{}","side":"{}","signatureType":0,"signature":"0x{}"}}}}"#,
+            r#"{{"deferExec":false,"order":{{"salt":{},"maker":"0x{}","signer":"0x{}","taker":"0x{}","tokenId":"{}","makerAmount":"{}","takerAmount":"{}","side":"{}","expiration":"{}","nonce":"{}","feeRateBps":"{}","signatureType":{},"signature":"0x{}"}},"owner":"{}","orderType":"{}"}}"#,
             self.salt,
             hex::encode(self.maker),
             hex::encode(self.signer),
@@ -256,11 +277,14 @@ impl RawOrder {
             u256_to_dec(&self.token_id),
             self.maker_amount,
             self.taker_amount,
+            if self.side == 0 { "BUY" } else { "SELL" },
             self.expiration,
             self.nonce,
             self.fee_rate_bps,
-            if self.side == 0 { "BUY" } else { "SELL" },
-            hex::encode(sig)
+            self.signature_type,
+            hex::encode(sig),
+            owner_api_key,
+            order_type,
         );
         Ok(json)
     }
@@ -291,32 +315,56 @@ fn u256_to_dec(b: &[u8; 32]) -> String {
 
 // ── helpers for building BUY orders ─────────────────────────────────────────
 
-/// Build a marketable BUY order for `size` shares at `price` (dollars,
-/// 0.01 grid). Collateral is 6-decimal USDC; shares are 6-decimal units.
-/// BUY semantics: makerAmount = collateral, takerAmount = shares.
+/// Build a marketable BUY order for `size` shares at `price` (dollars) on a
+/// market with the given tick grid and taker fee. Collateral is 6-decimal
+/// USDC; shares are 6-decimal units. BUY semantics: makerAmount = collateral,
+/// takerAmount = shares. The price is rounded UP to the tick grid so the order
+/// stays marketable; size is floored to 2 decimals (share lot grid).
 pub fn build_buy_order(
     token_id_dec: &str,
     price_dollars: f64,
     size_shares: f64,
     maker: [u8; 20],
+    tick_size: f64,
+    fee_rate_bps: u64,
 ) -> Result<RawOrder> {
-    let price = (price_dollars * 100.0).round() / 100.0; // 1¢ grid
-    if !(0.01..=0.99).contains(&price) {
+    let tick = if tick_size.is_finite() && tick_size > 0.0 && tick_size <= 0.1 {
+        tick_size
+    } else {
+        0.01 // observed grid on the 5-minute BTC series
+    };
+    if !(tick..=1.0).contains(&price_dollars) {
+        bail!("price out of range: {price_dollars}");
+    }
+    // ceil to the tick grid with a tolerance that absorbs f64 representation
+    // noise when the price is already on the grid (0.56/0.01 = 56.000000000000005)
+    let ratio = price_dollars / tick;
+    let steps = (ratio - 1e-6).ceil().max(1.0);
+    if steps > 999.0 {
+        bail!("price out of range: {price_dollars}");
+    }
+    let price = (steps * tick * 1e9).round() / 1e9;
+    if !(tick..=0.99).contains(&price) {
         bail!("price out of range: {price}");
     }
-    let shares = (size_shares * 100.0).round() / 100.0;
+    let shares = (size_shares * 100.0).floor() / 100.0; // 2 decimals, down
     if shares < 5.0 {
         bail!("size below 5-share minimum: {shares}");
     }
     let taker = [0u8; 20];
     let token = u256_from_dec(token_id_dec)?;
-    let collateral = (shares * price * 1e6).round() as u128;
     let share_raw = (shares * 1e6).round() as u128;
+    let collateral = ((share_raw as f64) * price).round() as u128;
+    // JSON-safe unique salt (< 2^53, mirroring the official client's
+    // Math.round(Math.random() * Date.now()))
     let salt: u128 = {
         use rand::RngCore;
-        let mut b = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut b);
-        u128::from_be_bytes(b) & 0x7fff_ffff_ffff_ffff_ffff_ffff_ffff_ffff
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let r = (rand::thread_rng().next_u32() % 1000) as u64;
+        (now_ms.wrapping_mul(1000).wrapping_add(r)) as u128
     };
     Ok(RawOrder {
         salt,
@@ -328,14 +376,17 @@ pub fn build_buy_order(
         taker_amount: share_raw,
         expiration: 0,
         nonce: 0,
-        fee_rate_bps: 0,
+        fee_rate_bps: fee_rate_bps as u128,
         side: 0,
+        signature_type: 0, // EOA
     })
 }
 
 // ── L2 HMAC headers ─────────────────────────────────────────────────────────
 
-/// L2 auth headers: POLY_SIGNATURE = HMAC-SHA256(secret, ts‖method‖path‖body).
+/// L2 auth headers. POLY_SIGNATURE = HMAC-SHA256(base64-decoded secret,
+/// ts‖method‖path‖body) encoded as URL-safe base64 WITH padding ('=' kept,
+/// '+'→'-' and '/'→'_'), exactly like the official client.
 pub fn l2_headers(
     creds: &Creds,
     address_hex: &str,
@@ -352,19 +403,18 @@ pub fn l2_headers(
     let message = format!("{ts_sec}{method}{path}{body}");
     let mut mac = HmacSha256::new_from_slice(&secret_raw).unwrap_or_else(|_| unreachable!());
     mac.update(message.as_bytes());
-    let sig = hex::encode(mac.finalize().into_bytes());
+    let sig = base64_urlsafe_encode(&mac.finalize().into_bytes());
 
     vec![
         ("POLY_ADDRESS".into(), address_hex.into()),
         ("POLY_SIGNATURE".into(), sig),
         ("POLY_TIMESTAMP".into(), format!("{ts_sec}")),
-        ("POLY_NONCE".into(), "0".into()),
         ("POLY_API_KEY".into(), creds.api_key.clone()),
-        ("POLY_PASSPHRASE".into(), creds.secret.clone()),
+        ("POLY_PASSPHRASE".into(), creds.passphrase.clone()),
     ]
 }
 
-/// API credentials from POST /auth/derive-key.
+/// API credentials from GET /auth/derive-api-key.
 #[derive(Debug, Clone)]
 pub struct Creds {
     pub api_key: String,
@@ -372,9 +422,18 @@ pub struct Creds {
     pub passphrase: String,
 }
 
-/// Minimal base64 decode (standard alphabet, padding tolerated).
+/// Minimal base64 decode (standard alphabet; padding tolerated, base64url
+/// input characters are sanitized first, matching the official client).
 pub fn base64_decode(s: &str) -> Result<Vec<u8>> {
-    let s: String = s.chars().filter(|c| !c.eq(&'=')).collect();
+    let s: String = s
+        .chars()
+        .filter(|c| !c.eq(&'='))
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            _ => c,
+        })
+        .collect();
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
@@ -395,6 +454,31 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// URL-safe base64 encode (standard alphabet with '+'→'-' and '/'→'_',
+/// '=' padding kept) — the encoding for the L2 HMAC signature.
+pub fn base64_urlsafe_encode(data: &[u8]) -> String {
+    // URL-safe alphabet: 62 = '-', 63 = '_' (padding '=' kept)
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(TBL[((n >> 18) & 63) as usize] as char);
+        out.push(TBL[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TBL[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TBL[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -460,30 +544,95 @@ mod tests {
             nonce: 0,
             fee_rate_bps: 0,
             side: 0,
+            signature_type: 0,
         };
         let d1 = o.digest();
         let d2 = o.digest();
         assert_eq!(d1, d2);
         o.maker_amount += 1;
         assert_ne!(d1, o.digest());
+        o.signature_type = 2;
+        assert_ne!(d1, o.digest()); // signatureType is part of the typehash
         assert_eq!(d1.len(), 32);
     }
 
     #[test]
     fn buy_order_amounts() {
         let maker = [7u8; 20];
-        let o = build_buy_order("123456789012345678901234567890", 0.56, 100.0, maker).unwrap();
+        let tok = "123456789012345678901234567890";
+        let o = build_buy_order(tok, 0.56, 100.0, maker, 0.01, 1000).unwrap();
         // 100 shares @ $0.56 → collateral 56 USDC = 56e6 raw; shares 100e6
         assert_eq!(o.maker_amount, 56_000_000);
         assert_eq!(o.taker_amount, 100_000_000);
         assert_eq!(o.side, 0);
-        assert!(build_buy_order("123456789012345678901234567890", 0.56, 4.9, maker).is_err());
+        assert_eq!(o.signature_type, 0);
+        assert_eq!(o.fee_rate_bps, 1000); // market taker fee carried on the order
+        assert!(o.salt < (1u128 << 53)); // JSON-number-safe salt
+        // price is ceiled UP to the tick grid (marketable): 0.563 → 0.57
+        let up = build_buy_order(tok, 0.563, 100.0, maker, 0.01, 0).unwrap();
+        assert_eq!(up.maker_amount, 57_000_000);
+        // finer grid: 0.5604 on a 0.001 tick → 0.561
+        let fine = build_buy_order(tok, 0.5604, 100.0, maker, 0.001, 0).unwrap();
+        assert_eq!(fine.maker_amount, 56_100_000);
+        // size floors to 2 decimals: 100.999 → 100.99
+        let sz = build_buy_order(tok, 0.56, 100.999, maker, 0.01, 0).unwrap();
+        assert_eq!(sz.taker_amount, 100_990_000);
+        assert!(build_buy_order(tok, 0.56, 4.9, maker, 0.01, 0).is_err());
+        assert!(build_buy_order(tok, 0.0, 100.0, maker, 0.01, 0).is_err());
+    }
+
+    #[test]
+    fn signed_body_payload_shape() {
+        let kb = keccak256(b"payload shape test key");
+        let sk = SigningKey::from_slice(&kb).unwrap();
+        let maker = address_of(&sk);
+        let order =
+            build_buy_order("123456789012345678901234567890", 0.56, 100.0, maker, 0.01, 1000)
+                .unwrap();
+        let body = order
+            .signed_body(&sk, false, "uuid-api-key", "FOK")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["deferExec"], false);
+        assert_eq!(v["owner"], "uuid-api-key");
+        assert_eq!(v["orderType"], "FOK");
+        let o = &v["order"];
+        assert_eq!(o["salt"].as_u64().unwrap(), order.salt as u64); // JSON number
+        assert_eq!(o["side"], "BUY"); // string in the REST payload
+        assert_eq!(o["signatureType"], 0); // number in the REST payload
+        assert_eq!(o["tokenId"].as_str().unwrap(), "123456789012345678901234567890");
+        assert_eq!(o["makerAmount"].as_str().unwrap(), "56000000"); // string
+        assert_eq!(o["takerAmount"].as_str().unwrap(), "100000000");
+        assert_eq!(o["feeRateBps"].as_str().unwrap(), "1000");
+        let sig = o["signature"].as_str().unwrap();
+        assert!(sig.starts_with("0x") && sig.len() == 132); // 65 bytes hex
+        assert_eq!(o["maker"].as_str().unwrap(), format!("0x{}", hex::encode(maker)));
+        assert_eq!(o["taker"].as_str().unwrap(), "0x0000000000000000000000000000000000000000");
+    }
+
+    #[test]
+    fn clob_auth_signature_is_deterministic() {
+        let kb = keccak256(b"clob auth test key");
+        let sk = SigningKey::from_slice(&kb).unwrap();
+        let a = clob_auth_signature(&sk, 1_700_000_000, 0).unwrap();
+        let b = clob_auth_signature(&sk, 1_700_000_000, 0).unwrap();
+        assert_eq!(a, b); // RFC-6979 deterministic ECDSA
+        assert!(a[64] == 27 || a[64] == 28);
     }
 
     #[test]
     fn base64_works() {
         assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
         assert_eq!(base64_decode("aGVsbG8h").unwrap(), b"hello!");
+        assert_eq!(base64_decode("-_8=").unwrap(), b"\xfb\xff"); // base64url sanitized
         assert!(base64_decode("!!").is_err());
+        // roundtrip through the url-safe encoder
+        for n in 0..40 {
+            let data: Vec<u8> = (0..n).map(|i| (i * 37 % 256) as u8).collect();
+            let enc = base64_urlsafe_encode(&data);
+            assert_eq!(base64_decode(&enc).unwrap(), data);
+        }
+        assert_eq!(base64_urlsafe_encode(b"ab"), "YWI=");
+        assert_eq!(base64_urlsafe_encode(&[0xfb, 0xff]), "-_8="); // '+'→'-', '/'→'_', '=' kept
     }
 }

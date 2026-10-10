@@ -1,27 +1,15 @@
-# deps / build
-node_modules/
-.next/
-target/
-bun.lockb
-
-# runtime artifacts
+.env
+.env.*
+!.env.example
+.zscripts/
+.zskills/
+xarb-rs/target/
+*.pid
 *.log
 db/
-.env
-engine.log
-server.log
-
-# local media / scratch
-upload/
-scripts/*.png
-xarb-rs/*.png
-rust-ui.png
-
-# os
-.DS_Store
-
-# local/internal (not part of the project)
+!db/.gitkeep
+node_modules/
 skills/
-tests/
+.next/
 download/
-next-env.d.ts
+upload/

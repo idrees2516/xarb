@@ -75,8 +75,8 @@ fn evaluate(eng: &std::sync::Arc<crate::Engine>) {
         ring.push(now, out.value);
     }
 
-    // polymarket book
-    let (ask_c, _ask_size, book_age_ms, ladder) = {
+    // polymarket book (+ live market taker fee observed on the WS)
+    let (ask_c, _ask_size, book_age_ms, ladder, market_fee) = {
         let pm = eng.pm.lock().unwrap();
         let best = pm.book.best_ask();
         (
@@ -84,6 +84,7 @@ fn evaluate(eng: &std::sync::Arc<crate::Engine>) {
             best.map(|l| l.s).unwrap_or(0.0),
             pm.book.age_ms(now),
             pm.book.ask_ladder_usd(),
+            pm.fee_rate_bps,
         )
     };
     let fresh = book_age_ms < max_age as u64;
@@ -101,6 +102,8 @@ fn evaluate(eng: &std::sync::Arc<crate::Engine>) {
     let trig: Trig = *eng.trig.lock().unwrap();
     if trig.all() {
         if let Some(ask) = ask_c {
+            // market taker fee (observed on the WS) wins over the settings knob
+            let effective_fee = market_fee.map(|f| f as f64).unwrap_or(fee_bps);
             crate::fire::try_fire(
                 eng,
                 out.value,
@@ -115,7 +118,7 @@ fn evaluate(eng: &std::sync::Arc<crate::Engine>) {
                 auto_trade,
                 min_secs,
                 max_trades,
-                fee_bps,
+                effective_fee,
                 strike,
             );
         }

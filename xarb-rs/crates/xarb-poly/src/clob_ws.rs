@@ -42,7 +42,6 @@ pub struct PmState {
     pub updates: u64,
     pub last_trade_px: Option<f64>,
     pub fee_rate_bps: Option<u64>,
-    pub(crate) last_alive_at: u64,
     pub(crate) last_book_at: u64,
 }
 
@@ -54,7 +53,6 @@ impl Default for PmState {
             updates: 0,
             last_trade_px: None,
             fee_rate_bps: None,
-            last_alive_at: 0,
             last_book_at: 0,
         }
     }

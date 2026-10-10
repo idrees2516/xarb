@@ -61,7 +61,9 @@ impl Settings {
             self.model = FvModel::from_str(x);
         }
         if let Some(x) = v["takerFeeBps"].as_f64() {
-            self.taker_fee_bps = x.clamp(0.0, 500.0);
+            // up to 2000 bps: the live 5-minute BTC series has been observed
+            // at a 1000 bps base taker fee — let users mirror that honestly
+            self.taker_fee_bps = x.clamp(0.0, 2000.0);
         }
         if let Some(x) = v["maxBookAgeMs"].as_u64() {
             self.max_book_age_ms = x.clamp(100, 60_000);
