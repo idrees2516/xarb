@@ -57,6 +57,37 @@ export function fvCdf(s: number, k: number, tSec: number, sigmaPts: number): num
   return fvCdfDetail(s, k, tSec, sigmaPts).value
 }
 
+/** Fair value with an EXPLICIT effective σ (no legacy clamp) — used when the
+ *  v0.4 σ auto-calibration supplies the blended/floored/snapped σ. */
+export function fvCdfEff(
+  s: number,
+  k: number,
+  tSec: number,
+  sigmaEffPts: number
+): { value: number; z: number; sd: number; slope: number } {
+  const sd = Math.max(sigmaEffPts * Math.sqrt(Math.max(tSec, 1)), 5)
+  const z = (s - k) / sd
+  const value = clamp(normCdf(z) * 100, 1, 99)
+  const slope = (normPdf(z) * 100) / sd
+  return { value, z, sd, slope }
+}
+
+/** Digital-option delta per UP share: BTC to short per $1 of BTC move
+ *  (hedge qty per share = φ(d)/sd). Positive = long-direction exposure.
+ *  DOWN shares carry the negated delta (long DOWN = short direction). */
+export function digitalDeltaPerShare(s: number, k: number, tSec: number, sigmaEffPts: number): number {
+  const sd = Math.max(sigmaEffPts * Math.sqrt(Math.max(tSec, 1)), 5)
+  return normPdf((s - k) / sd) / sd
+}
+
+/** Digital-option position gamma magnitude per share (hedge-qty curvature,
+ *  BTC per $): |d|·φ(d)/sd². Drives the Whalley–Wilmott re-hedge band. */
+export function digitalGammaPerShare(s: number, k: number, tSec: number, sigmaEffPts: number): number {
+  const sd = Math.max(sigmaEffPts * Math.sqrt(Math.max(tSec, 1)), 5)
+  const d = (s - k) / sd
+  return (Math.abs(d) * normPdf(d)) / (sd * sd)
+}
+
 /** Abramowitz & Stegun 7.1.26 (fixed: Q = φ·t·(b1 + b2·t + …), no double-t) */
 export function normCdf(z: number): number {
   const t = 1 / (1 + 0.2316419 * Math.abs(z))

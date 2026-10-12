@@ -1,111 +1,162 @@
-// ─── XARB engine service ──────────────────────────────────────────────────────
-// socket.io server on :3001. Frontend connects via io('/?XTransformPort=3001').
+// ─── XARB engine service — entry (supervisor mode) ───────────────────────────
+// This module runs under `bun --hot` as the BOOT-BLESSED process. Hot reloads
+// discard timers created during module evaluation, so this file NEVER runs the
+// engine itself — it only supervises children (each survives tool-call
+// reaping because they descend from this process):
+//   • engine-main.ts (bun, :3001) — the actual engine + socket.io server
+//   • xarb-server (Rust core, :3002)
+//   • Next.js dev server (:3000, only when the platform's own is down)
+// All spawns are synchronous at module level with pidfile:gen ownership
+// tokens; exit-respawn runs from the live event loop with backoff.
 
-import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { Server } from 'socket.io'
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 
-import { Engine } from './src/engine'
-import type { ControlMsg, InitPayload } from './src/types'
+const ROOT = '/home/z/my-project'
+const HERE = `${ROOT}/mini-services/xarb-engine`
 
-const PORT = 3001
-
-// ─── Rust core supervisor (preview infra) ─────────────────────────────────────
-// The Rust terminal (xarb-server, :3002) runs as a child of this long-lived
-// bun process so it survives sandbox process reaping between tool calls.
-// Hot-reload safe: the supervisor state lives on globalThis; a reload (or a
-// later-built binary) re-triggers the spawn when no child is alive. A stale
-// pid file kills the previous instance; child exit auto-respawns with
-// backoff (crash self-healing).
+type Sup = { child: any; crashes: number }
 const g = globalThis as any
-if (!g.__xarbRsSupervisor2 || !g.__xarbRsSupervisor2.launch) {
-  g.__xarbRsSupervisor2 = { child: null as any, crashes: 0, launch: null }
-}
-const SUP = g.__xarbRsSupervisor2
-const BIN = '/home/z/my-project/xarb-rs/target/release/xarb-server'
-const PIDFILE = '/tmp/xarb-rs.pid'
-// Synchronous launch at module level: bun --hot discards timers scheduled
-// during module evaluation, so the first spawn must not go through setTimeout.
-// Crash/exit respawns DO use timers — they fire from the live event loop.
-const launchRs = () => {
-  if (SUP.child) return
-  if (!existsSync(BIN)) {
-    console.log('[supervisor] xarb-rs release binary not found — TS engine only (rebuild + reload)')
-    return
-  }
+
+// ── shared pidfile helpers ────────────────────────────────────────────────────
+function readPid(path: string): { pid: number; gen: string } {
   try {
-    const stale = Number(readFileSync(PIDFILE, 'utf8').trim())
-    if (stale > 0) process.kill(stale, 'SIGTERM')
-  } catch { /* no stale instance */ }
-  try {
-    const child = spawn(BIN, [], {
-      env: { ...process.env, XARB_PORT: '3002' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    SUP.child = child
-    writeFileSync(PIDFILE, String(child.pid))
-    child.stdout?.on('data', (d) => console.log('[xarb-rs]', String(d).trim()))
-    child.stderr?.on('data', (d) => console.error('[xarb-rs]', String(d).trim()))
-    child.on('exit', (code) => {
-      SUP.child = null
-      SUP.crashes++
-      const backoff = Math.min(1000 * 2 ** Math.min(SUP.crashes, 5), 30_000)
-      console.log(`[xarb-rs] exited (${code}) — respawn in ${backoff}ms (crash #${SUP.crashes})`)
-      setTimeout(launchRs, backoff)
-    })
-    console.log(`[supervisor] xarb-rs spawned pid=${child.pid} on :3002`)
-  } catch (e) {
-    SUP.child = null
-    console.log('[supervisor] xarb-rs spawn failed:', String(e))
+    const [pid, gen] = readFileSync(path, 'utf8').trim().split(':')
+    return { pid: Number(pid) || 0, gen: gen ?? '' }
+  } catch {
+    return { pid: 0, gen: '' }
   }
 }
-SUP.launch = launchRs
-if (!SUP.child) launchRs()
+function writePid(path: string, pid: number, gen: string): void {
+  try {
+    writeFileSync(path, `${pid}:${gen}`)
+  } catch { /* best-effort */ }
+}
+const newGen = () => Math.random().toString(36).slice(2, 8)
 
-const httpServer = createServer()
-const io = new Server(httpServer, {
-  // DO NOT change the path, it is used by Caddy to forward the request
-  path: '/',
-  cors: { origin: '*', methods: ['GET', 'POST'] },
-  pingTimeout: 60000,
-  pingInterval: 25000,
-})
-
-const engine = new Engine()
-engine.onSnap = (s) => io.emit('snap', s)
-engine.onSignal = (sig) => io.emit('signal', sig)
-engine.onSettle = (t) => io.emit('settle', t)
-engine.start()
-
-io.on('connection', (socket) => {
-  console.log(`[ws] client ${socket.id} connected`)
-  const init: InitPayload = engine.buildInit()
-  socket.emit('init', init)
-
-  socket.on('control', (msg: ControlMsg) => {
-    try {
-      engine.control(msg)
-      io.emit('init', engine.buildInit())
-    } catch (e) {
-      console.log('[ws] control error', String(e))
+function makeSupervisor(opts: {
+  key: string
+  pidfile: string
+  isAlive?: () => Promise<boolean>
+  spawnArgs: () => { cmd: string; args: string[]; cwd: string; env?: Record<string, string> }
+  label: string
+  /** Always supersede a previous instance on eval (dev iteration: reload
+   *  the supervisor → fresh child with the newest code). */
+  supersede?: boolean
+}) {
+  const store: Sup = (g[opts.key] ??= { child: null, crashes: 0 })
+  const GEN = newGen()
+  const launch = async () => {
+    if (store.child && !opts.supersede) return
+    if (store.child && opts.supersede && readPid(opts.pidfile).gen === GEN) return
+    if (opts.isAlive && (await opts.isAlive())) {
+      console.log(`[${opts.label}] already serving — not spawning`)
+      return
     }
-  })
+    const stale = readPid(opts.pidfile)
+    if (stale.pid > 0 && stale.gen !== GEN) {
+      try {
+        // NOTE: no await here — timers scheduled during module evaluation
+        // (bun --hot reloads) are DISCARDED, which would silently kill this
+        // continuation and leave no replacement child. The old child's
+        // graceful 1.5s shutdown overlaps with the new bind; an EADDRINUSE
+        // on the new child self-heals via the live-loop respawn backoff.
+        process.kill(stale.pid, 'SIGTERM')
+      } catch { /* already dead */ }
+    }
+    try {
+      const { cmd, args, cwd, env } = opts.spawnArgs()
+      const child = spawn(cmd, args, {
+        cwd,
+        env: env ? { ...process.env, ...env } : process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      store.child = child
+      writePid(opts.pidfile, child.pid, GEN)
+      // reload-eval console output is swallowed by bun --hot → tee child
+      // output to a file so crashes are diagnosable
+      const logPath = `${ROOT}/.zscripts/sup-${opts.label}.log`
+      const tee = (d: any) => {
+        try {
+          appendFileSync(logPath, String(d))
+        } catch { /* best-effort */ }
+      }
+      child.stdout?.on('data', tee)
+      child.stderr?.on('data', tee)
+      child.on('exit', (code) => {
+        store.child = null
+        store.crashes++
+        const owner = readPid(opts.pidfile).gen
+        if (owner && owner !== GEN) {
+          console.log(`[${opts.label}] superseded by a newer module — not respawning`)
+          return
+        }
+        const backoff = Math.min(1000 * 2 ** Math.min(store.crashes, 5), 30_000)
+        console.log(
+          `[${opts.label}] exited (${code}) — respawn in ${backoff}ms (crash #${store.crashes})`
+        )
+        setTimeout(launch, backoff)
+      })
+      console.log(`[${opts.label}] spawned pid=${child.pid}`)
+    } catch (e) {
+      store.child = null
+      console.log(`[${opts.label}] spawn failed:`, String(e))
+    }
+  }
+  void launch()
+}
 
-  socket.on('disconnect', () => {
-    console.log(`[ws] client ${socket.id} disconnected`)
-  })
+// ── 1. The TS engine itself (clean child process — timers fully alive) ────────
+// Port 3011 — 3001 is held forever by a zombie listener from the original
+// hot-reloaded module; the frontend follows via XTransformPort=3011.
+makeSupervisor({
+  key: '__xarbEngineChildSup',
+  pidfile: '/tmp/xarb-engine-child.pid',
+  supersede: true, // reload supervisor → fresh engine with newest code
+  spawnArgs: () => ({ cmd: 'bun', args: ['engine-main.ts'], cwd: HERE }),
+  label: 'engine',
 })
 
-httpServer.listen(PORT, () => {
-  console.log(`[xarb-engine] listening on :${PORT}`)
+// ── 2. Rust core (xarb-server, :3002) ─────────────────────────────────────────
+makeSupervisor({
+  key: '__xarbRsSupervisor3',
+  pidfile: '/tmp/xarb-rs.pid',
+  isAlive: async () => {
+    try {
+      const r = await fetch('http://localhost:3002/api/snapshot', {
+        signal: AbortSignal.timeout(2000),
+      })
+      return r.ok
+    } catch {
+      return false
+    }
+  },
+  spawnArgs: () => {
+    const BIN = `${ROOT}/xarb-rs/target/release/xarb-server`
+    if (!existsSync(BIN)) throw new Error('xarb-rs release binary not found')
+    return { cmd: BIN, args: [], cwd: HERE, env: { XARB_PORT: '3002' } }
+  },
+  label: 'xarb-rs',
 })
 
-process.on('SIGTERM', () => {
-  console.log('SIGTERM, shutting down…')
-  httpServer.close(() => process.exit(0))
+// ── 3. Next.js dashboard (only when the platform's own dev server is down) ────
+makeSupervisor({
+  key: '__xarbNextSupervisor',
+  pidfile: '/tmp/xarb-next.pid',
+  isAlive: async () => {
+    try {
+      const r = await fetch('http://localhost:3000/', { signal: AbortSignal.timeout(2500) })
+      return r.ok
+    } catch {
+      return false
+    }
+  },
+  spawnArgs: () => ({ cmd: 'bun', args: ['run', 'dev'], cwd: ROOT }),
+  label: 'next',
 })
-process.on('SIGINT', () => {
-  console.log('SIGINT, shutting down…')
-  httpServer.close(() => process.exit(0))
-})
+
+console.log('[supervisor] xarb engine supervisor up (engine :3001 · rust :3002 · next :3000)')
+// supervisor reload marker 1791777201
+// kick1 1791777446
+// kick3 1791777493
+// reload 1791778615

@@ -30,6 +30,9 @@ export function Header() {
   const running = useXarb((s) => s.snapshot?.running ?? false)
   const secsLeft = useXarb((s) => s.snapshot?.window.secondsLeft ?? 0)
   const strike = useXarb((s) => s.snapshot?.window.strike ?? null)
+  const sigmaAuto = useXarb((s) => s.snapshot?.sigma.auto ?? true)
+  const hedgeOn = useXarb((s) => s.snapshot?.hedge.on ?? false)
+  const hedgeActive = useXarb((s) => s.snapshot?.hedge.active ?? false)
 
   return (
     <header className="sticky top-0 z-20 border-b border-[#1e222a] bg-[#0b0d11]/95 backdrop-blur">
@@ -62,6 +65,16 @@ export function Header() {
             extra={running ? 'running' : 'stopped'}
           />
           <FeedBadge label="WS" status={connected ? 'live' : 'down'} />
+          <FeedBadge
+            label="σ-CAL"
+            status={sigmaAuto ? 'live' : 'down'}
+            extra={sigmaAuto ? 'auto' : 'legacy'}
+          />
+          <FeedBadge
+            label="δ-HEDGE"
+            status={hedgeOn ? (hedgeActive ? 'live' : 'connecting') : 'down'}
+            extra={hedgeOn ? (hedgeActive ? 'holding' : 'armed') : 'off'}
+          />
         </div>
 
         <div className="ms-auto flex items-center gap-2">

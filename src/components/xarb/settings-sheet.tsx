@@ -163,6 +163,148 @@ export function SettingsSheet({ trigger }: { trigger: React.ReactNode }) {
 
           <Separator className="bg-[#1e222a]" />
 
+          {/* ── v0.4: σ auto-calibration ── */}
+          <div className="text-[10px] font-semibold uppercase tracking-widest text-cyan-400/80">
+            σ auto-calibration (live PM)
+          </div>
+
+          <SettingRow label="Auto-calibrate σ" hint="implied inversion from PM mids">
+            <div className="flex items-center gap-3">
+              <Switch
+                checked={settings.sigmaAuto}
+                onCheckedChange={(v) => updateSettings({ sigmaAuto: v })}
+              />
+              <span className={`text-xs ${settings.sigmaAuto ? 'text-cyan-400' : 'text-zinc-500'}`}>
+                {settings.sigmaAuto ? 'AUTO — snap tracks PM' : 'legacy fixed floor'}
+              </span>
+            </div>
+          </SettingRow>
+
+          <SettingRow label="Implied weight in blend" hint={`w_imp ${settings.sigmaWImp.toFixed(2)}`}>
+            <Slider
+              value={[settings.sigmaWImp]}
+              min={0}
+              max={1}
+              step={0.05}
+              onValueCommit={(v) => updateSettings({ sigmaWImp: v[0] })}
+            />
+          </SettingRow>
+
+          <SettingRow label="Identifiability gate |Φ⁻¹(mid)|" hint={settings.sigmaZGate.toFixed(2)}>
+            <Slider
+              value={[settings.sigmaZGate]}
+              min={0.1}
+              max={1}
+              step={0.05}
+              onValueCommit={(v) => updateSettings({ sigmaZGate: v[0] })}
+            />
+          </SettingRow>
+
+          <SettingRow label="Dynamic floor k × median(σ_imp)" hint={`k ${settings.sigmaFloorK.toFixed(2)}`}>
+            <Slider
+              value={[settings.sigmaFloorK]}
+              min={0.1}
+              max={1.5}
+              step={0.05}
+              onValueCommit={(v) => updateSettings({ sigmaFloorK: v[0] })}
+            />
+          </SettingRow>
+
+          <SettingRow label="Absolute σ floor" hint={`${settings.sigmaAbsFloor.toFixed(1)} pts/√s`}>
+            <Slider
+              value={[settings.sigmaAbsFloor]}
+              min={3}
+              max={30}
+              step={0.5}
+              onValueCommit={(v) => updateSettings({ sigmaAbsFloor: v[0] })}
+            />
+          </SettingRow>
+
+          <Separator className="bg-[#1e222a]" />
+
+          {/* ── v0.4: δ-hedging ── */}
+          <div className="text-[10px] font-semibold uppercase tracking-widest text-fuchsia-400/80">
+            δ-hedging (Binance)
+          </div>
+
+          <SettingRow label="Delta-hedge binary exposure" hint="W–W band policy">
+            <div className="flex items-center gap-3">
+              <Switch checked={settings.hedgeOn} onCheckedChange={(v) => updateSettings({ hedgeOn: v })} />
+              <span className={`text-xs ${settings.hedgeOn ? 'text-fuchsia-400' : 'text-zinc-500'}`}>
+                {settings.hedgeOn ? 'HEDGED — shorts Δ on Binance' : 'directional (unhedged)'}
+              </span>
+            </div>
+          </SettingRow>
+
+          <SettingRow label="Hedge ratio (Δ fraction)" hint={`${(settings.hedgeRatio * 100).toFixed(0)}% of delta`}>
+            <Slider
+              value={[settings.hedgeRatio]}
+              min={0}
+              max={1}
+              step={0.05}
+              onValueCommit={(v) => updateSettings({ hedgeRatio: v[0] })}
+            />
+          </SettingRow>
+
+          <SettingRow label="Binance taker fee" hint={`${settings.hedgeFeeBps.toFixed(1)} bps`}>
+            <Slider
+              value={[settings.hedgeFeeBps]}
+              min={0}
+              max={100}
+              step={0.5}
+              onValueCommit={(v) => updateSettings({ hedgeFeeBps: v[0] })}
+            />
+          </SettingRow>
+
+          <SettingRow label="Wind-down horizon" hint={`${settings.hedgeWinddownS}s before close`}>
+            <Slider
+              value={[settings.hedgeWinddownS]}
+              min={5}
+              max={60}
+              step={5}
+              onValueCommit={(v) => updateSettings({ hedgeWinddownS: v[0] })}
+            />
+          </SettingRow>
+
+          <Separator className="bg-[#1e222a]" />
+
+          {/* ── v0.4: profitability gate + early exit ── */}
+          <div className="text-[10px] font-semibold uppercase tracking-widest text-emerald-400/80">
+            Profitability & capture
+          </div>
+
+          <SettingRow label="④ Min net edge to fire" hint={`${settings.minNetEdgeC.toFixed(1)}¢ after fees + hedge`}>
+            <Slider
+              value={[settings.minNetEdgeC]}
+              min={0}
+              max={20}
+              step={0.5}
+              onValueCommit={(v) => updateSettings({ minNetEdgeC: v[0] })}
+            />
+          </SettingRow>
+
+          <SettingRow label="Early-exit band (PM bid vs FV)" hint={`${settings.exitBandC.toFixed(1)}¢`}>
+            <Slider
+              value={[settings.exitBandC]}
+              min={0}
+              max={15}
+              step={0.5}
+              onValueCommit={(v) => updateSettings({ exitBandC: v[0] })}
+            />
+          </SettingRow>
+
+          <SettingRow label="Min captured edge to exit" hint={`${settings.minCaptureC.toFixed(1)}¢/sh`}>
+            <Slider
+              value={[settings.minCaptureC]}
+              min={0}
+              max={20}
+              step={0.5}
+              onValueCommit={(v) => updateSettings({ minCaptureC: v[0] })}
+            />
+          </SettingRow>
+
+          <Separator className="bg-[#1e222a]" />
+
           <div className="flex gap-2">
             <Button
               variant="outline"

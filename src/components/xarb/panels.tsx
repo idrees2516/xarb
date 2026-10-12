@@ -75,11 +75,14 @@ export function TriggerPanel() {
   const fv = useXarb((s) => s.snapshot?.fv.value ?? 50)
   const edge = useXarb((s) => s.snapshot?.edge.fvAsk ?? null)
   const trig = useXarb((s) => s.snapshot?.triggers)
+  const edgeBlock = useXarb((s) => s.snapshot?.edge)
   const jumpT = useXarb((s) => s.settings.jumpThreshC)
   const floorT = useXarb((s) => s.settings.fvFloorC)
   const edgeT = useXarb((s) => s.settings.edgeThreshC)
+  const netT = useXarb((s) => s.settings.minNetEdgeC)
   const running = useXarb((s) => s.snapshot?.running ?? false)
 
+  const net = edgeBlock?.net ?? null
   const armedCount = trig ? [trig.jump, trig.above60, trig.gap].filter(Boolean).length : 0
 
   return (
@@ -113,6 +116,19 @@ export function TriggerPanel() {
           armed={!!trig?.gap}
           progress={(edge ?? 0) / edgeT}
         />
+        {/* v0.4: net-edge profitability gate (fees + hedge cost) */}
+        <TriggerRow
+          label="④ Net edge after costs"
+          value={net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(1)}¢`}
+          threshold={`${netT}`}
+          unit="¢"
+          armed={!!trig?.net}
+          progress={net / netT}
+        />
+        <div className="pb-1 font-mono text-[9px] leading-relaxed text-zinc-600">
+          ④ = ③ − PM fee {(edgeBlock?.feeC ?? 0).toFixed(1)}¢ − hedge cost {(edgeBlock?.hedgeCostC ?? 0).toFixed(1)}¢ — the
+          strategy only fires when the mispricing is profitable AFTER all modeled costs.
+        </div>
       </div>
       <div
         className={`mt-3 rounded-md border px-3 py-2 text-center text-[11px] font-semibold tracking-wide ${
@@ -122,10 +138,17 @@ export function TriggerPanel() {
         }`}
       >
         {trig?.all ? (
-          <span className="animate-pulse">⚡ ALL 3 TRUE — BUY SIGNAL</span>
+          trig?.net ? (
+            <span className="animate-pulse">⚡ ALL 3 + NET-EDGE — PROFITABLE FIRE</span>
+          ) : (
+            <span className="animate-pulse text-amber-300">
+              ⚡ 3 triggers up · gated by costs (net {net?.toFixed(1) ?? '—'}¢ &lt; {netT}¢)
+            </span>
+          )
         ) : (
           <span>
             waiting · {armedCount}/3 armed
+            {trig?.net ? <span className="text-emerald-400"> · net-edge ✓</span> : null}
           </span>
         )}
       </div>

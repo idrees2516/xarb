@@ -7,6 +7,7 @@ const ACTION_STYLE: Record<string, string> = {
   EXECUTED: 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300',
   SKIPPED: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
   WATCH: 'border-zinc-600/50 bg-zinc-500/10 text-zinc-400',
+  EXIT: 'border-cyan-500/50 bg-cyan-500/15 text-cyan-300',
 }
 
 export function SignalFeed() {
@@ -46,10 +47,16 @@ export function SignalFeed() {
                   <span className={s.edge != null && s.edge > 0 ? 'text-emerald-400' : 'text-zinc-500'}>
                     edge {s.edge != null ? `${s.edge >= 0 ? '+' : ''}${s.edge.toFixed(1)}¢` : '—'}
                   </span>
+                  {s.netEdgeC != null ? (
+                    <span className={s.netEdgeC >= 0 ? 'text-emerald-300' : 'text-red-300'}>
+                      net {s.netEdgeC >= 0 ? '+' : ''}{s.netEdgeC.toFixed(1)}¢
+                    </span>
+                  ) : null}
                   <span className="text-zinc-500">jump {s.jump5s >= 0 ? '+' : ''}{s.jump5s.toFixed(1)}¢</span>
                   {s.action === 'EXECUTED' && s.fillPrice != null ? (
                     <span className="text-emerald-300">
                       filled {s.fillPrice.toFixed(1)}¢ × {Math.round(s.shares ?? 0)}sh
+                      {s.sigmaEffPts != null ? ` · σ ${s.sigmaEffPts.toFixed(1)}` : ''}
                     </span>
                   ) : null}
                 </div>
@@ -72,6 +79,7 @@ export function TradeBlotter() {
     OPEN: 'border-zinc-500/40 bg-zinc-500/10 text-zinc-300',
     WON: 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300',
     LOST: 'border-red-500/50 bg-red-500/15 text-red-300',
+    EXITED: 'border-cyan-500/50 bg-cyan-500/15 text-cyan-300',
   }
 
   return (
@@ -94,8 +102,10 @@ export function TradeBlotter() {
               <tr className="text-[9px] uppercase tracking-wider text-zinc-600">
                 <th className="px-3 py-1.5 font-medium">time</th>
                 <th className="px-2 py-1.5 font-medium">fill</th>
+                <th className="px-2 py-1.5 text-right font-medium">net¢</th>
                 <th className="px-2 py-1.5 text-right font-medium">shares</th>
                 <th className="px-2 py-1.5 text-right font-medium">cost</th>
+                <th className="px-2 py-1.5 text-right font-medium">hedge</th>
                 <th className="px-2 py-1.5 text-center font-medium">status</th>
                 <th className="px-3 py-1.5 text-right font-medium">p&amp;l</th>
               </tr>
@@ -105,8 +115,23 @@ export function TradeBlotter() {
                 <tr key={t.id} className="border-t border-[#181c22] font-mono text-[11px] tabular-nums hover:bg-[#141821]">
                   <td className="px-3 py-1.5 text-zinc-500">{fmtClock(t.ts)}</td>
                   <td className="px-2 py-1.5 text-zinc-200">{t.priceC.toFixed(1)}¢</td>
+                  <td
+                    className={`px-2 py-1.5 text-right ${
+                      t.netEdgeC == null ? 'text-zinc-600' : t.netEdgeC >= 0 ? 'text-emerald-400' : 'text-red-400'
+                    }`}
+                  >
+                    {t.netEdgeC == null ? '—' : `${t.netEdgeC >= 0 ? '+' : ''}${t.netEdgeC.toFixed(1)}`}
+                  </td>
                   <td className="px-2 py-1.5 text-right text-zinc-400">{Math.round(t.shares)}</td>
                   <td className="px-2 py-1.5 text-right text-zinc-400">${t.costUsd.toFixed(2)}</td>
+                  <td className="px-2 py-1.5 text-right text-zinc-500">
+                    {t.hedgeQtyBtc ? `${t.hedgeQtyBtc.toFixed(3)}₿` : '—'}
+                    {t.hedgePnlUsd != null ? (
+                      <span className={t.hedgePnlUsd >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+                        {' '}{t.hedgePnlUsd >= 0 ? '+' : ''}{t.hedgePnlUsd.toFixed(2)}
+                      </span>
+                    ) : null}
+                  </td>
                   <td className="px-2 py-1.5 text-center">
                     <span
                       className={`rounded border px-1.5 py-px text-[9px] font-bold tracking-wider ${STATUS_STYLE[t.status]} ${
@@ -115,6 +140,9 @@ export function TradeBlotter() {
                     >
                       {t.status}
                     </span>
+                    {t.exitPxC != null ? (
+                      <span className="ms-1 text-[9px] text-cyan-400/70">@{t.exitPxC.toFixed(0)}¢</span>
+                    ) : null}
                   </td>
                   <td
                     className={`px-3 py-1.5 text-right ${

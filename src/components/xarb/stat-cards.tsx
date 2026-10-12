@@ -1,6 +1,7 @@
 'use client'
 
 import { useXarb, fmtPrice, fmtCents, fmtPnl, fmtCountdown } from '@/lib/xarb'
+import { Sigma, ShieldHalf, Crosshair } from 'lucide-react'
 
 function Card({
   title,
@@ -69,6 +70,10 @@ export function StatCards() {
   const trades = useXarb((s) => s.snapshot?.stats.trades ?? 0)
   const winRate = useXarb((s) => s.snapshot?.stats.winRate ?? 0)
   const avgEdge = useXarb((s) => s.snapshot?.stats.avgEdgeC ?? 0)
+  const sigmaEffModel =
+    model === 'cdf'
+      ? `Φ(z) · σ_eff ${sigmaEffPts.toFixed(1)} · slope ${slope.toFixed(3)}¢/pt`
+      : `52 + slope·(S−K) · slope ${slope.toFixed(3)}¢/pt`
 
   const edgeCls =
     edge == null ? 'text-zinc-500' : edge >= edgeThresh ? 'text-emerald-400' : edge > 0 ? 'text-emerald-300/70' : 'text-red-400'
@@ -106,7 +111,7 @@ export function StatCards() {
         </div>
       </Card>
 
-      <Card title="UP fair value" hint={model === 'linear' ? 'linear spec model' : 'normal-cdf · calibrated'} accent="bg-emerald-500/70">
+      <Card title="UP fair value" hint={model === 'linear' ? 'linear spec model' : 'normal-cdf · σ auto-cal'} accent="bg-emerald-500/70">
         <div className={`${big} text-emerald-300`}>{fmtCents(fv)}</div>
         <div className={sub}>
           <span>5sΔ</span>
@@ -115,11 +120,11 @@ export function StatCards() {
         </div>
         <div className={sub}>
           <span className="text-zinc-600">
-            z {zScore >= 0 ? '+' : ''}{zScore.toFixed(2)}σ · σ_eff {sigmaEffPts.toFixed(1)} · slope {slope.toFixed(3)}¢/pt
+            z {zScore >= 0 ? '+' : ''}{zScore.toFixed(2)}σ · {sigmaEffModel}
           </span>
         </div>
         <div className={sub}>
-          <span className="text-zinc-600">{model === 'linear' ? '52 + slope·(S−K)' : 'Φ(z) · bounded 1–99¢ · honest tails'}</span>
+          <span className="text-zinc-600">{model === 'linear' ? 'legacy spec curve' : 'Φ(z) · bounded 1–99¢ · honest tails'}</span>
         </div>
       </Card>
 
@@ -151,7 +156,7 @@ export function StatCards() {
         </div>
       </Card>
 
-      <Card title="Session P&L" hint="paper">
+      <Card title="Session P&L" hint="paper · hedged">
         <div className={`${big} ${pnlCls}`}>{fmtPnl(pnlTotal)}</div>
         <div className={sub}>
           <span>real {fmtPnl(pnlReal)}</span>
@@ -160,6 +165,135 @@ export function StatCards() {
         <div className={sub}>
           <span className="text-zinc-600">
             {trades} trades · {winRate.toFixed(0)}% win · avg {avgEdge.toFixed(1)}¢ edge
+          </span>
+        </div>
+      </Card>
+    </div>
+  )
+}
+
+// ─── v0.4 row: σ auto-calibration · δ-hedge · value capture ───────────────────
+
+export function V04Cards() {
+  const sigma = useXarb((s) => s.snapshot?.sigma)
+  const hedge = useXarb((s) => s.snapshot?.hedge)
+  const capture = useXarb((s) => s.snapshot?.capture)
+  const netEdge = useXarb((s) => s.snapshot?.edge.net ?? null)
+  const minNetEdge = useXarb((s) => s.settings.minNetEdgeC)
+
+  const snapFresh = !!sigma?.effIsSnap
+  const snapAge = sigma?.snapAgeMs
+  const capRatio =
+    capture && capture.edgeSeenC > 1 && capture.fired > 0
+      ? Math.min((capture.avgNetEdgeC * capture.fired) / capture.edgeSeenC, 1.5)
+      : null
+
+  return (
+    <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+      {/* σ auto-calibration */}
+      <Card
+        title="σ auto-calibration"
+        hint={sigma?.auto ? 'from live PM mids' : 'legacy fixed floor'}
+        accent="bg-cyan-500/70"
+      >
+        <div className="flex items-baseline gap-2">
+          <Sigma className="h-4 w-4 text-cyan-400/70" />
+          <div className={`${big} text-cyan-300`}>
+            {sigma ? sigma.eff.toFixed(1) : '—'}
+            <span className="ms-1 text-[10px] font-normal text-zinc-500">pts/√s</span>
+          </div>
+        </div>
+        <div className={sub}>
+          <span className="text-zinc-600">imp</span>
+          <span className="text-cyan-200/90">{sigma ? sigma.imp.toFixed(1) : '—'}</span>
+          <span className="text-zinc-600">real</span>
+          <span>{sigma ? sigma.real.toFixed(1) : '—'}</span>
+          <span className="text-zinc-600">floor</span>
+          <span>{sigma ? sigma.floor.toFixed(1) : '—'}</span>
+        </div>
+        <div className={sub}>
+          {sigma?.auto ? (
+            snapFresh ? (
+              <span className="font-semibold text-cyan-300">
+                SNAP locked · FV tracks PM ({snapAge != null ? `${Math.round(snapAge)}ms` : '—'})
+              </span>
+            ) : (
+              <span className="text-zinc-500">blend + dynamic floor · PM silent → FV floats with Binance</span>
+            )
+          ) : (
+            <span className="text-zinc-500">auto-cal off · legacy clamp of realized σ</span>
+          )}
+        </div>
+        <div className={sub}>
+          <span className="text-zinc-600">
+            samples {sigma ? sigma.accepted : 0}✓ / {sigma ? sigma.rejected : 0}✗ · |Φ⁻¹(mid)| gate rejects unidentifiable mids
+          </span>
+        </div>
+      </Card>
+
+      {/* δ-hedge on Binance */}
+      <Card
+        title="δ-hedge · Binance"
+        hint={hedge?.on ? `ratio ${(hedge.ratio * 100).toFixed(0)}% · ${(hedge.feeBps ?? 0).toFixed(1)}bps` : 'off'}
+        accent="bg-fuchsia-500/70"
+      >
+        <div className="flex items-baseline gap-2">
+          <ShieldHalf className="h-4 w-4 text-fuchsia-400/70" />
+          <div className={`${big} ${hedge?.active ? 'text-fuchsia-300' : 'text-zinc-500'}`}>
+            {hedge?.active ? `${hedge.qtyBtc.toFixed(4)}` : 'FLAT'}
+            {hedge?.active ? <span className="ms-1 text-[10px] font-normal text-zinc-500">BTC</span> : null}
+          </div>
+          {hedge?.winddown && hedge?.active ? (
+            <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1 py-px text-[9px] font-bold text-amber-400">
+              WIND-DOWN
+            </span>
+          ) : null}
+        </div>
+        <div className={sub}>
+          <span className="text-zinc-600">target</span>
+          <span className="text-fuchsia-200/90">{hedge ? hedge.targetBtc.toFixed(4) : '—'}</span>
+          <span className="text-zinc-600">band ±{hedge ? hedge.bandBtc.toFixed(4) : '—'}</span>
+        </div>
+        <div className={sub}>
+          <span className="text-zinc-600">Δ/sh {hedge ? hedge.deltaPerShare.toFixed(4) : '—'} BTC</span>
+          <span className={hedge?.active ? 'text-zinc-400' : 'text-zinc-600'}>
+            {hedge?.shares ? `${Math.round(hedge.shares)} sh` : ''}
+          </span>
+        </div>
+        <div className={sub}>
+          <Delta v={hedge?.pnlUsd ?? 0} suffix=" pnl" digits={2} />
+          <span className="text-zinc-600">fees ${hedge ? hedge.feesUsd.toFixed(3) : '0'} · {hedge?.fills ?? 0} fills · W–W band</span>
+        </div>
+      </Card>
+
+      {/* value capture */}
+      <Card title="Value capture" hint="zero engine-miss" accent="bg-emerald-500/70">
+        <div className="flex items-baseline gap-2">
+          <Crosshair className="h-4 w-4 text-emerald-400/70" />
+          <div className={`${big} ${netEdge != null && netEdge >= minNetEdge ? 'text-emerald-300' : 'text-zinc-200'}`}>
+            {netEdge != null ? `${netEdge >= 0 ? '+' : ''}${netEdge.toFixed(1)}` : '—'}
+            <span className="ms-1 text-[10px] font-normal text-zinc-500">¢ net edge</span>
+          </div>
+        </div>
+        <div className={sub}>
+          <span className="text-zinc-600">
+            edge − PM fee − hedge cost · fires ≥ {minNetEdge}¢ — the profit gate
+          </span>
+        </div>
+        <div className={sub}>
+          <span className="text-zinc-600">opps</span>
+          <span className="text-emerald-200/90">{capture?.opportunities ?? 0}</span>
+          <span className="text-zinc-600">fired</span>
+          <span>{capture?.fired ?? 0}</span>
+          <span className="text-zinc-600">gated</span>
+          <span className="text-amber-300/90">{capture?.missed ?? 0}</span>
+          <span className="text-zinc-600">early exits</span>
+          <span className="text-cyan-300/90">{capture?.earlyExits ?? 0}</span>
+        </div>
+        <div className={sub}>
+          <span className="text-zinc-600">
+            edge seen {(capture?.edgeSeenC ?? 0).toFixed(0)}¢ · avg net {capture && capture.fired > 0 ? `${capture.avgNetEdgeC >= 0 ? '+' : ''}${capture.avgNetEdgeC.toFixed(1)}¢` : '—'}
+            {capRatio != null ? ` · capture ${(capRatio * 100).toFixed(0)}%` : ''}
           </span>
         </div>
       </Card>

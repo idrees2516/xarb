@@ -3,7 +3,7 @@
 import { useEffect } from 'react'
 import { connectEngine } from '@/lib/xarb'
 import { Header } from '@/components/xarb/header'
-import { StatCards } from '@/components/xarb/stat-cards'
+import { StatCards, V04Cards } from '@/components/xarb/stat-cards'
 import { PriceChart, FvChart } from '@/components/xarb/charts'
 import { TriggerPanel, BookLadder, LatencyPanel } from '@/components/xarb/panels'
 import { SignalFeed, TradeBlotter } from '@/components/xarb/feeds'
@@ -29,6 +29,11 @@ export default function Page() {
       <main className="mx-auto w-full max-w-[1600px] flex-1 space-y-3 px-3 py-3 sm:px-5 sm:py-4">
         {/* live stats */}
         <StatCards />
+
+        {/* v0.4: σ auto-cal · δ-hedge · value capture */}
+        <section aria-label="Sigma calibration, delta hedge and value capture">
+          <V04Cards />
+        </section>
 
         {/* charts */}
         <section aria-label="Live charts" className="rounded-lg border border-[#22262e] bg-[#101318] p-3.5">
@@ -73,15 +78,25 @@ export default function Page() {
           <p>
             <span className="font-semibold text-zinc-400">Rule:</span> BUY UP when ① fair-value jumps ≥ 20¢ within
             5s <span className="text-zinc-500">AND</span> ② FV &gt; 60¢ <span className="text-zinc-500">AND</span> ③
-            Polymarket ask is ≥ 10¢ under fair value — all in the same tick. FV derived from Binance BTCUSDT distance
-            to the window strike and time remaining (spec-calibrated: 55¢ @ +15pts, 77¢ @ +130pts, T=120s).
+            Polymarket ask is ≥ 10¢ under fair value <span className="text-zinc-500">AND</span> ④ the net edge
+            (edge − PM taker fee − estimated Binance hedge cost) clears the floor — all in the same tick. FV =
+            Φ((S−K)/(σ_eff·√T)) with σ_eff auto-calibrated from live PM mids.
+          </p>
+          <p className="mt-1">
+            <span className="font-semibold text-zinc-400">v0.4 engine:</span> σ auto-calibration inverts the live
+            Polymarket mid (Φ⁻¹) into an implied σ, EWMA-fuses it with Binance realized vol behind a dynamic
+            median floor, and snap-pins FV to the market&apos;s own quote while it prints — the edge appears only in
+            the reaction-lag window. Every fill is δ-hedged on Binance (Whalley–Wilmott no-trade band, wind-down
+            before the expiry gamma explosion, force-flatten at close); early exits bank the mispricing when PM
+            re-converges. Opportunity capture accounting proves zero engine-missed episodes.
           </p>
           <p className="mt-1">
             <span className="font-semibold text-zinc-400">Notes:</span> paper trading for research — no orders are
-            sent. Windows resolve on Chainlink BTC/USD TWAP; this terminal settles paper positions on the Binance mid
-            at close as a proxy. &quot;EST&quot; strike = engine joined mid-window (calibrates exactly at the next
-            open). Live taker fee shown from the feed. Not financial advice; check Polymarket eligibility &amp; terms
-            before trading real funds.
+            sent; hedge fills cross the live Binance top-of-book in paper mode. Windows resolve on Chainlink
+            BTC/USD TWAP; this terminal settles paper positions on the Binance mid at close as a proxy. Live PM
+            taker fee (observed 1000 bps on the 5m series) is folded into the net-edge gate. &quot;EST&quot; strike =
+            engine joined mid-window. Not financial advice; check Polymarket eligibility &amp; terms before trading
+            real funds.
           </p>
         </footer>
       </main>

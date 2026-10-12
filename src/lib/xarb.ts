@@ -33,11 +33,14 @@ export interface SignalLog {
   edge: number | null
   jump5s: number
   secondsLeft: number
-  action: 'EXECUTED' | 'SKIPPED' | 'WATCH'
+  action: 'EXECUTED' | 'SKIPPED' | 'WATCH' | 'EXIT'
   reason?: string
   fillPrice?: number
   shares?: number
   stake?: number
+  /** Net edge after PM fee + hedge cost at decision time (¢/share). */
+  netEdgeC?: number | null
+  sigmaEffPts?: number
 }
 
 export interface Trade {
@@ -50,11 +53,19 @@ export interface Trade {
   shares: number
   costUsd: number
   feeUsd: number
-  status: 'OPEN' | 'WON' | 'LOST'
+  status: 'OPEN' | 'WON' | 'LOST' | 'EXITED'
   pnlUsd: number | null
   finalPrice: number | null
   fvAtEntry: number
   edgeAtEntry: number
+  netEdgeC?: number | null
+  sigmaEffPts?: number
+  hedgeQtyBtc?: number
+  hedgePnlUsd?: number | null
+  hedgeFeesUsd?: number
+  hedgeFills?: number
+  exitPxC?: number | null
+  exitReason?: string | null
 }
 
 export interface Settings {
@@ -68,6 +79,22 @@ export interface Settings {
   model: 'linear' | 'cdf'
   takerFeeBps: number
   maxBookAgeMs: number
+  // v0.4: σ auto-calibration from live PM prices
+  sigmaAuto: boolean
+  sigmaWImp: number
+  sigmaZGate: number
+  sigmaFloorK: number
+  sigmaAbsFloor: number
+  // v0.4: δ-hedging on Binance
+  hedgeOn: boolean
+  hedgeRatio: number
+  hedgeFeeBps: number
+  hedgeMinBandBtc: number
+  hedgeWinddownS: number
+  // v0.4: profitability & value capture
+  minNetEdgeC: number
+  exitBandC: number
+  minCaptureC: number
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -81,6 +108,32 @@ export const DEFAULT_SETTINGS: Settings = {
   model: 'cdf',
   takerFeeBps: 0,
   maxBookAgeMs: 3000,
+  sigmaAuto: true,
+  sigmaWImp: 0.65,
+  sigmaZGate: 0.35,
+  sigmaFloorK: 0.75,
+  sigmaAbsFloor: 6,
+  hedgeOn: true,
+  hedgeRatio: 0.5,
+  hedgeFeeBps: 4.5,
+  hedgeMinBandBtc: 0.002,
+  hedgeWinddownS: 20,
+  minNetEdgeC: 1.5,
+  exitBandC: 2,
+  minCaptureC: 5,
+}
+
+/** A Binance hedge fill event (initial short / re-hedge / cover / flatten). */
+export interface HedgeEvent {
+  ts: number
+  tradeId: string
+  qtyBtc: number
+  px: number
+  feeUsd: number
+  reason: string
+  posQtyBtc: number
+  pnlUsd: number
+  sigmaEffPts: number
 }
 
 export interface Snapshot {
@@ -112,6 +165,44 @@ export interface Snapshot {
     slope: number
     distFromStrike: number
   }
+  /** v0.4: σ auto-calibration state (live PM implied inversion). */
+  sigma: {
+    auto: boolean
+    imp: number
+    real: number
+    floor: number
+    eff: number
+    snap: number | null
+    snapAgeMs: number | null
+    effIsSnap: boolean
+    accepted: number
+    rejected: number
+  }
+  /** v0.4: Binance delta-hedge state. */
+  hedge: {
+    on: boolean
+    ratio: number
+    feeBps: number
+    active: boolean
+    qtyBtc: number
+    targetBtc: number
+    bandBtc: number
+    deltaPerShare: number
+    shares: number
+    pnlUsd: number
+    feesUsd: number
+    fills: number
+    winddown: boolean
+  }
+  /** v0.4: opportunity capture accounting (zero-miss proof). */
+  capture: {
+    opportunities: number
+    fired: number
+    missed: number
+    edgeSeenC: number
+    earlyExits: number
+    avgNetEdgeC: number
+  }
   pm: {
     bid: number | null
     ask: number | null
@@ -121,8 +212,14 @@ export interface Snapshot {
     asks: LevelC[]
     bids: LevelC[]
   }
-  edge: { fvAsk: number | null; fvMid: number | null }
-  triggers: { jump: boolean; above60: boolean; gap: boolean; all: boolean }
+  edge: {
+    fvAsk: number | null
+    fvMid: number | null
+    feeC: number | null
+    hedgeCostC: number
+    net: number | null
+  }
+  triggers: { jump: boolean; above60: boolean; gap: boolean; all: boolean; net: boolean }
   stats: {
     pnlRealized: number
     pnlUnrealized: number
@@ -189,7 +286,9 @@ let socket: Socket | null = null
 
 export function connectEngine(): Socket {
   if (socket) return socket
-  socket = io('/?XTransformPort=3001', {
+  // 3011: the engine runs as a supervised clean child process; 3001 is held
+  // by a legacy listener inside the hot-reloaded supervisor and is unused.
+  socket = io('/?XTransformPort=3011', {
     transports: ['websocket', 'polling'],
     forceNew: true,
     reconnection: true,
@@ -226,20 +325,33 @@ export function connectEngine(): Socket {
     useXarb.setState((st) => ({ signals: [sig, ...st.signals].slice(0, 60) }))
     if (sig.action === 'EXECUTED' && sig.fillPrice != null) {
       toast.success(`BUY UP filled @ ${sig.fillPrice.toFixed(1)}¢`, {
-        description: `edge +${(sig.edge ?? 0).toFixed(1)}¢ · jump ${sig.jump5s.toFixed(1)}¢ · ${Math.round(sig.shares ?? 0)} sh · $${sig.stake ?? 0}`,
+        description: `edge +${(sig.edge ?? 0).toFixed(1)}¢ · net +${(sig.netEdgeC ?? 0).toFixed(1)}¢ · jump ${sig.jump5s.toFixed(1)}¢ · ${Math.round(sig.shares ?? 0)} sh · $${sig.stake ?? 0}`,
+      })
+    } else if (sig.action === 'EXIT') {
+      toast.success(`EARLY EXIT · banked @ ${sig.fillPrice?.toFixed(1) ?? '—'}¢`, {
+        description: sig.reason ?? '',
       })
     }
   })
 
+  socket.on('hedge', (e: HedgeEvent) => {
+    const short = e.qtyBtc < 0
+    toast(short ? 'HEDGE · SHORT BTC' : 'HEDGE · COVER BTC', {
+      description: `${e.qtyBtc.toFixed(4)} BTC @ ${e.px.toFixed(1)} · ${e.reason} · pos ${e.posQtyBtc.toFixed(4)} · ${e.feeUsd.toFixed(3)} fee`,
+    })
+  })
+
   socket.on('settle', (t: Trade) => {
     useXarb.setState((st) => ({ trades: st.trades.map((x) => (x.id === t.id ? t : x)) }))
+    const hedgeNote =
+      t.hedgePnlUsd != null ? ` · hedge ${t.hedgePnlUsd >= 0 ? '+' : ''}${t.hedgePnlUsd.toFixed(2)}` : ''
     if (t.status === 'WON') {
       toast.success(`Window settled UP · WON +$${(t.pnlUsd ?? 0).toFixed(2)}`, {
-        description: `final ${t.finalPrice?.toFixed(1)} vs strike ${t.strike.toFixed(1)}`,
+        description: `final ${t.finalPrice?.toFixed(1)} vs strike ${t.strike.toFixed(1)}${hedgeNote}`,
       })
     } else if (t.status === 'LOST') {
       toast.error(`Window settled DOWN · LOST $${Math.abs(t.pnlUsd ?? 0).toFixed(2)}`, {
-        description: `final ${t.finalPrice?.toFixed(1)} vs strike ${t.strike.toFixed(1)}`,
+        description: `final ${t.finalPrice?.toFixed(1)} vs strike ${t.strike.toFixed(1)}${hedgeNote}`,
       })
     }
   })

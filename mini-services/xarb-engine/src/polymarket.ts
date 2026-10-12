@@ -20,6 +20,9 @@ export type PMStatus = 'connecting' | 'live' | 'down'
 export class PolymarketFeed {
   status: PMStatus = 'connecting'
   updates = 0
+  /** Book version — bumped on every book-affecting event. The engine's σ
+   *  auto-calibrator folds one sample per version (fresh print detection). */
+  bookVer = 0
   lastTradePx: number | null = null
   feeRateBps: number | null = null
 
@@ -221,6 +224,7 @@ export class PolymarketFeed {
     }
     if (changed) {
       this.updates++
+      this.bookVer++
       this.onBook?.()
     }
   }
@@ -281,6 +285,7 @@ export class PolymarketFeed {
           this.lastBookAt = Date.now()
           this.lastAliveAt = Date.now()
           this.updates++
+          this.bookVer++
           if (this.status !== 'live') this.status = 'down'
           this.onBook?.()
         }
