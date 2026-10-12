@@ -1,0 +1,22 @@
+{
+  "equity_c": -2600.0,
+  "latency": {
+    "tick_to_signal_p50_ns": 4483,
+    "tick_to_signal_p99_ns": 42654
+  },
+  "realized_c": -2600.0,
+  "rejects": [
+    0,
+    6944,
+    8261,
+    327201,
+    5713,
+    26770,
+    0,
+    277
+  ],
+  "signals": 65,
+  "trades": 65,
+  "unrealized_c": 0.0,
+  "windows": 30
+}

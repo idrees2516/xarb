@@ -1,0 +1,17 @@
+LICENSE
+README.md
+setup.py
+poly_eip712_structs/__init__.py
+poly_eip712_structs/domain_separator.py
+poly_eip712_structs/struct.py
+poly_eip712_structs/types.py
+poly_eip712_structs.egg-info/PKG-INFO
+poly_eip712_structs.egg-info/SOURCES.txt
+poly_eip712_structs.egg-info/dependency_links.txt
+poly_eip712_structs.egg-info/requires.txt
+poly_eip712_structs.egg-info/top_level.txt
+tests/test_domain_separator.py
+tests/test_encode_data.py
+tests/test_encode_type.py
+tests/test_message_json.py
+tests/test_types.py

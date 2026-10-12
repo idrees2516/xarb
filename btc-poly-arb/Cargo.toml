@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wire",
+    "crates/hotcore",
+    "crates/pricing",
+    "crates/strategy",
+    "crates/feeds",
+    "crates/clob",
+    "crates/engine",
+    "crates/sim",
+    "crates/server",
+    "crates/ui",
+    "crates/cli",
+]
+default-members = [
+    "crates/wire",
+    "crates/hotcore",
+    "crates/pricing",
+    "crates/strategy",
+    "crates/feeds",
+    "crates/clob",
+    "crates/engine",
+    "crates/sim",
+    "crates/server",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["btc-poly-arb"]
+
+[workspace.dependencies]
+wire = { path = "crates/wire" }
+hotcore = { path = "crates/hotcore" }
+pricing = { path = "crates/pricing" }
+strategy = { path = "crates/strategy" }
+feeds = { path = "crates/feeds" }
+clob = { path = "crates/clob" }
+engine = { path = "crates/engine" }
+sim = { path = "crates/sim" }
+server = { path = "crates/server" }
+cli = { path = "crates/cli" }
+
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+libc = "0.2"
+core_affinity = "0.8"
+libm = "0.2"
+k256 = { version = "0.13", features = ["ecdsa"] }
+tiny-keccak = { version = "2", features = ["keccak"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "json"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+axum = { version = "0.7", features = ["ws"] }
+rust-embed = { version = "8", features = ["compression"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+leptos = { version = "0.7", features = ["csr"] }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "BinaryType", "Window", "console"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = false
+overflow-checks = false
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,19 @@
+[package]
+name = "sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wire = { workspace = true }
+hotcore = { workspace = true }
+pricing = { workspace = true }
+strategy = { workspace = true }
+engine = { workspace = true }
+clob = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

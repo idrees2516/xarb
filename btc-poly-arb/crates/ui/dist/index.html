@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>polyarb — Polymarket x Binance</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module">
+      import init from "./ui.js";
+      // wasm_bindgen(start) mounts the Leptos app automatically
+      init().catch((e) => {
+        document.body.innerHTML =
+          '<pre style="color:#ff5470;padding:2em;font-family:monospace">failed to boot WASM: ' + e + "</pre>";
+      });
+    </script>
+  </body>
+</html>

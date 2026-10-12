@@ -1,0 +1,61 @@
+# polyarb configuration
+# ---------------------
+# The tweet's numbers are the defaults:
+#   FV jumps >= 20c within 5 seconds, FV over 60c, PM ask 10c+ cheaper -> BUY.
+
+[strategy]
+jump_c = 0.20          # the "20c+ within 5 seconds" trigger
+fv_gate = 0.60         # momentum gate: only buy favorites
+edge_c = 0.10          # PM must be >= 10c cheaper than FV
+jump_window_s = 5.0
+trade_down = true      # symmetric DOWN leg (BTC dumps -> buy DOWN)
+min_tau_s = 10.0       # no entries in the last 10s of a window
+
+[pricing]
+model = "bs"           # "bs" (Black-Scholes digital) | "linear" (tweet-style)
+sigma_mode = "fixed"   # "fixed" (tweet semantics) | "live" (EWMA) | "blend"
+sigma_fallback = 0.00013   # per-second sigma (~0.23% per 5m window)
+vol_half_life_s = 120.0
+
+[exec]
+size_shares = 50       # shares per trade (PM min is 5)
+order_type = "FAK"     # fill-and-kill (IOC) — taker only
+max_chase_c = 3        # chase at most 3c above the ask at signal
+use_ladder = false     # pre-signed order ladder (zero-signature fire path)
+ladder_refresh_s = 20.0
+paper_latency_ms = 250 # simulated network+matching latency in paper mode
+paper_slippage_c = 0
+
+[risk]
+max_pos_shares = 200       # one-direction position cap
+max_trades_per_window = 2
+cooldown_s = 8.0           # between fires
+daily_loss_stop_usd = 100.0
+max_notional_per_trade_usd = 200.0
+stale_binance_ms = 400     # no trading on a stale Binance feed
+stale_pm_ms = 2000
+min_balance_usd = 20.0
+
+[engine]
+spin = true            # 100% busy-spin on the pinned core (disable to park)
+dash_fps = 10
+mark_source = "micro"  # "mid" | "last" | "micro" (microprice)
+
+[dashboard]
+bind = "0.0.0.0:8080"
+
+[endpoints]
+binance_ws = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@bookTicker"
+polymarket_ws = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+clob_rest = "https://clob.polymarket.com"
+gamma_rest = "https://gamma-api.polymarket.com"
+
+[log]
+# jsonl_path = "logs/events.jsonl"
+
+# NOTES
+# - live trading also needs:  POLY_PK env var (wallet private key),
+#   USDC on Polygon, and CLOB exchange/CTF allowances set once via the
+#   Polymarket UI. Run `polyarb doctor` to verify.
+# - the 5m series resolves on Chainlink BTC-USD TWAP while market makers
+#   hedge off Binance; the residual basis is a real (small) risk.

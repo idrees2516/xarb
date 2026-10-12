@@ -1,0 +1,18 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wire = { workspace = true }
+hotcore = { workspace = true }
+engine = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rust-embed = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

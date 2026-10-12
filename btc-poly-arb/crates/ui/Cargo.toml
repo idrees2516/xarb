@@ -1,0 +1,20 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ui"
+path = "src/main.rs"
+
+[dependencies]
+wire = { workspace = true }
+leptos = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { workspace = true }

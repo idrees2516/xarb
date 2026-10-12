@@ -1,0 +1,3 @@
+eth-utils>=4.1.1
+pycryptodome>=3.20.0
+pytest
