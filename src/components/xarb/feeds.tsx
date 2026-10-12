@@ -10,6 +10,11 @@ const ACTION_STYLE: Record<string, string> = {
   EXIT: 'border-cyan-500/50 bg-cyan-500/15 text-cyan-300',
 }
 
+const SIDE_STYLE: Record<string, string> = {
+  UP: 'text-emerald-300',
+  DOWN: 'text-red-300',
+}
+
 export function SignalFeed() {
   const signals = useXarb((s) => s.signals)
 
@@ -23,7 +28,7 @@ export function SignalFeed() {
       <div className="xarb-scroll max-h-[340px] min-h-0 flex-1 overflow-y-auto p-2">
         {signals.length === 0 ? (
           <div className="py-8 text-center text-[11px] text-zinc-600">
-            scanning · waiting for the first trigger event…
+            scanning {11} markets · both sides · waiting for the first trigger event…
           </div>
         ) : (
           <div className="space-y-1">
@@ -36,6 +41,12 @@ export function SignalFeed() {
                   <span className={`rounded border px-1.5 py-px text-[9px] font-bold tracking-wider ${ACTION_STYLE[s.action]}`}>
                     {s.action}
                   </span>
+                  {s.marketLabel ? (
+                    <span className="rounded border border-[#2a3038] bg-[#181c22] px-1.5 py-px text-[9px] font-bold text-zinc-300">
+                      {s.marketLabel}
+                    </span>
+                  ) : null}
+                  {s.side ? <span className={`text-[10px] font-bold ${SIDE_STYLE[s.side]}`}>{s.side}</span> : null}
                   <span className="font-mono text-[10px] tabular-nums text-zinc-500">{fmtClock(s.ts)}</span>
                   <span className="ms-auto font-mono text-[10px] tabular-nums text-zinc-500">
                     t−{Math.max(0, s.secondsLeft).toFixed(0)}s
@@ -94,13 +105,15 @@ export function TradeBlotter() {
       <div className="xarb-scroll max-h-[340px] min-h-0 flex-1 overflow-auto">
         {trades.length === 0 ? (
           <div className="py-8 text-center text-[11px] text-zinc-600">
-            no fills yet · entries appear when all 3 triggers fire
+            no fills yet · entries appear when all 3 triggers fire on any market
           </div>
         ) : (
           <table className="w-full border-collapse text-left">
             <thead className="sticky top-0 bg-[#101318]">
               <tr className="text-[9px] uppercase tracking-wider text-zinc-600">
                 <th className="px-3 py-1.5 font-medium">time</th>
+                <th className="px-2 py-1.5 font-medium">market</th>
+                <th className="px-2 py-1.5 font-medium">side</th>
                 <th className="px-2 py-1.5 font-medium">fill</th>
                 <th className="px-2 py-1.5 text-right font-medium">net¢</th>
                 <th className="px-2 py-1.5 text-right font-medium">shares</th>
@@ -114,6 +127,8 @@ export function TradeBlotter() {
               {trades.map((t) => (
                 <tr key={t.id} className="border-t border-[#181c22] font-mono text-[11px] tabular-nums hover:bg-[#141821]">
                   <td className="px-3 py-1.5 text-zinc-500">{fmtClock(t.ts)}</td>
+                  <td className="px-2 py-1.5 text-zinc-300">{t.marketLabel ?? t.market}</td>
+                  <td className={`px-2 py-1.5 font-bold ${SIDE_STYLE[t.side] ?? 'text-zinc-400'}`}>{t.side ?? 'UP'}</td>
                   <td className="px-2 py-1.5 text-zinc-200">{t.priceC.toFixed(1)}¢</td>
                   <td
                     className={`px-2 py-1.5 text-right ${
@@ -125,7 +140,7 @@ export function TradeBlotter() {
                   <td className="px-2 py-1.5 text-right text-zinc-400">{Math.round(t.shares)}</td>
                   <td className="px-2 py-1.5 text-right text-zinc-400">${t.costUsd.toFixed(2)}</td>
                   <td className="px-2 py-1.5 text-right text-zinc-500">
-                    {t.hedgeQtyBtc ? `${t.hedgeQtyBtc.toFixed(3)}₿` : '—'}
+                    {t.hedgeQtyBtc ? `${t.hedgeQtyBtc} ${t.hedgeAsset ?? 'BTC'}` : '—'}
                     {t.hedgePnlUsd != null ? (
                       <span className={t.hedgePnlUsd >= 0 ? 'text-emerald-400' : 'text-red-400'}>
                         {' '}{t.hedgePnlUsd >= 0 ? '+' : ''}{t.hedgePnlUsd.toFixed(2)}

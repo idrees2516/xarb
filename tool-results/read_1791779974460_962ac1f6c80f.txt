@@ -1,0 +1,1097 @@
+     1→// ─── XARB engine core ─────────────────────────────────────────────────────────
+     2→// Binance mid → UP fair value → trigger (5s jump ≥20¢ ∧ FV>60¢ ∧ gap ≥10¢)
+     3→// → paper-fill by walking the live Polymarket CLOB ask ladder → settle at close.
+     4→
+     5→import { BinanceFeed } from './binance'
+     6→import { PolymarketFeed } from './polymarket'
+     7→import {
+     8→  fvLinear,
+     9→  fvCdfEff,
+    10→  fvCdfDetail,
+    11→  sigmaEff,
+    12→  percentile,
+    13→  digitalDeltaPerShare,
+    14→} from './fairvalue'
+    15→import { SigmaCalib, DEFAULT_SIGMA_CFG } from './sigma'
+    16→import {
+    17→  applyHedgeFill,
+    18→  estHedgeCostC,
+    19→  hedgeIsFlat,
+    20→  hedgePnlAt,
+    21→  hedgeStep,
+    22→  newHedgePos,
+    23→  pmFeeCPerShare,
+    24→  SIDE_UP,
+    25→  DEFAULT_HEDGE_CFG,
+    26→  type HedgeCfg,
+    27→  type HedgePos,
+    28→} from './hedger'
+    29→import {
+    30→  DEFAULT_SETTINGS,
+    31→  type ChartPoint,
+    32→  type ControlMsg,
+    33→  type HedgeEvent,
+    34→  type InitPayload,
+    35→  type Settings,
+    36→  type SignalLog,
+    37→  type Snapshot,
+    38→  type Trade,
+    39→  type WindowInfo,
+    40→} from './types'
+    41→
+    42→const WINDOW_SEC = 300
+    43→const FV_PUSH_MS = 50
+    44→const FV_KEEP_MS = 20000
+    45→const CHART_PUSH_MS = 250
+    46→const CHART_CAP = 1440
+    47→const SIGNAL_COOLDOWN_MS = 5000
+    48→const SKIP_LOG_MS = 8000
+    49→const WATCH_LOG_MS = 10000
+    50→
+    51→const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+    52→const nowSec = () => Date.now() / 1000
+    53→const localMidnight = () => {
+    54→  const d = new Date()
+    55→  d.setHours(0, 0, 0, 0)
+    56→  return d.getTime()
+    57→}
+    58→const uid = () => Math.random().toString(36).slice(2, 9)
+    59→const r1 = (v: number): number => Math.round(v * 10) / 10
+    60→
+    61→/** z-score helper for the linear model row (still uses CDF σ for context). */
+    62→function d0(sigmaPts: number, tSec: number, price: number, strike: number): number {
+    63→  const sd = Math.max(sigmaEff(sigmaPts) * Math.sqrt(Math.max(tSec, 1)), 5)
+    64→  return (price - strike) / sd
+    65→}
+    66→
+    67→export class Engine {
+    68→  settings: Settings = { ...DEFAULT_SETTINGS }
+    69→  running = true
+    70→
+    71→  bin = new BinanceFeed()
+    72→  pm = new PolymarketFeed()
+    73→
+    74→  onSnap?: (s: Snapshot) => void
+    75→  onSignal?: (s: SignalLog) => void
+    76→  onSettle?: (t: Trade) => void
+    77→  onHedge?: (e: HedgeEvent) => void
+    78→
+    79→  // ── v0.4: σ auto-calibration + δ-hedging + capture ───────────────────
+    80→  private cal = new SigmaCalib()
+    81→  private lastCalVer = -1
+    82→  /** Effective σ actually in use (auto → calibrated; legacy → fixed floor). */
+    83→  private sigmaEffNow = 15.5
+    84→  /** Live Binance hedge position (null when flat). */
+    85→  private hedge: HedgePos | null = null
+    86→  private capture = {
+    87→    opportunities: 0,
+    88→    fired: 0,
+    89→    missed: 0,
+    90→    edgeSeenC: 0,
+    91→    earlyExits: 0,
+    92→    netEdgeSum: 0,
+    93→    netEdgeN: 0,
+    94→  }
+    95→  /** Rising-edge tracking of the 3-trigger conjunction (opportunity episodes). */
+    96→  private armedPrev = false
+    97→  private episodeFired = false
+    98→
+    99→  private win: WindowInfo | null = null
+   100→  private fvRing: { t: number; v: number }[] = []
+   101→  private chart: ChartPoint[] = []
+   102→  private signals: SignalLog[] = []
+   103→  private trades: Trade[] = []
+   104→  private trig = { jump: false, above60: false, gap: false, all: false }
+   105→  private lastFv = 50
+   106→  private lastFvAt = 0
+   107→  private lastChartPush = 0
+   108→  private lastSignalTs = 0
+   109→  private lastSkipLog: Record<string, number> = {}
+   110→  private lastWatchLog = 0
+   111→  private signalSeq = 0
+   112→  private loadEpochPromise: Promise<void> | null = null
+   113→
+   114→  // latency rings
+   115→  private feedLagRing: number[] = []
+   116→  private tickUsRing: number[] = []
+   117→  private decisionUsRing: number[] = []
+   118→
+   119→  private stats = {
+   120→    pnlRealized: 0,
+   121→    trades: 0,
+   122→    wins: 0,
+   123→    losses: 0,
+   124→    stakedUsd: 0,
+   125→    edgeSum: 0,
+   126→    edgeN: 0,
+   127→    triggersToday: 0,
+   128→    dayStart: localMidnight(),
+   129→  }
+   130→
+   131→  /** Hedge policy config view of the live settings. */
+   132→  private hedgeCfg(): HedgeCfg {
+   133→    const s = this.settings
+   134→    return {
+   135→      on: s.hedgeOn,
+   136→      ratio: s.hedgeRatio,
+   137→      feeBps: s.hedgeFeeBps,
+   138→      cWw: DEFAULT_HEDGE_CFG.cWw,
+   139→      minBandBtc: s.hedgeMinBandBtc,
+   140→      winddownS: s.hedgeWinddownS,
+   141→      flattenS: DEFAULT_HEDGE_CFG.flattenS,
+   142→      minQtyBtc: DEFAULT_HEDGE_CFG.minQtyBtc,
+   143→      qtyStepBtc: DEFAULT_HEDGE_CFG.qtyStepBtc,
+   144→      costTurnoverMult: DEFAULT_HEDGE_CFG.costTurnoverMult,
+   145→    }
+   146→  }
+   147→
+   148→  private syncSigmaCfg(): void {
+   149→    const s = this.settings
+   150→    this.cal.setCfg({
+   151→      auto: s.sigmaAuto,
+   152→      wImp: s.sigmaWImp,
+   153→      zGate: s.sigmaZGate,
+   154→      kappa: DEFAULT_SIGMA_CFG.kappa,
+   155→      floorK: s.sigmaFloorK,
+   156→      absFloor: s.sigmaAbsFloor,
+   157→      cap: DEFAULT_SIGMA_CFG.cap,
+   158→      histCap: DEFAULT_SIGMA_CFG.histCap,
+   159→    })
+   160→  }
+   161→
+   162→  start(): void {
+   163→    this.bin.onPrice = () => this.onMarketEvent()
+   164→    this.bin.onTrade = () => this.onMarketEvent()
+   165→    this.pm.onBook = () => this.onMarketEvent()
+   166→    this.syncSigmaCfg()
+   167→    this.bin.connect()
+   168→    this.pm.start()
+   169→    this.initWindow()
+   170→    this.ensureLoop()
+   171→    console.log('[engine] started v0.4 (paper mode, σ auto-cal + δ-hedge ON)')
+   172→  }
+   173→
+   174→  /** 10Hz loop handle + staleness watchdog. bun --hot DISCARDS timers created
+   175→   *  during module evaluation (hot reload), while WS handlers keep firing from
+   176→   *  the live event loop — so every market event re-arms a stale loop within
+   177→   *  ~100ms. Self-healing by construction. */
+   178→  private tickTimer: ReturnType<typeof setInterval> | null = null
+   179→  private lastTickAt = 0
+   180→
+   181→  ensureLoop(): void {
+   182→    const now = Date.now()
+   183→    if (this.tickTimer && now - this.lastTickAt < 2000) return // healthy
+   184→    const wasStale = this.lastTickAt > 0 && now - this.lastTickAt > 2000
+   185→    if (this.tickTimer) clearInterval(this.tickTimer)
+   186→    this.tickTimer = setInterval(() => this.tick(), 100)
+   187→    this.lastTickAt = now
+   188→    if (wasStale) console.log('[engine] tick loop re-armed (was discarded by hot reload)')
+   189→  }
+   190→
+   191→  // ── window lifecycle ────────────────────────────────────────────────────────
+   192→
+   193→  private initWindow(): void {
+   194→    const epoch = Math.floor(nowSec() / WINDOW_SEC) * WINDOW_SEC
+   195→    void this.loadWindow(epoch, true)
+   196→  }
+   197→
+   198→  private async loadWindow(epoch: number, estimated: boolean): Promise<void> {
+   199→    if (this.loadEpochPromise) return
+   200→    const task = (async () => {
+   201→      // wait for the first Binance price so the strike sample is valid
+   202→      let strike = this.bin.mid()
+   203→      for (let i = 0; i < 60 && strike <= 0; i++) {
+   204→        await sleep(100)
+   205→        strike = this.bin.mid()
+   206→      }
+   207→      // superseded while waiting (e.g. another rollover already ran)
+   208→      if (this.win && this.win.startEpoch !== epoch && this.win.startEpoch > epoch) return
+   209→      this.win = {
+   210→        startEpoch: epoch,
+   211→        endEpoch: epoch + WINDOW_SEC,
+   212→        slug: `btc-updown-5m-${epoch}`,
+   213→        question: '',
+   214→        upTokenId: '',
+   215→        downTokenId: '',
+   216→        conditionId: '',
+   217→        strike: strike > 0 ? strike : null,
+   218→        strikeEstimated: estimated,
+   219→        tokensLoaded: false,
+   220→        accepting: true,
+   221→      }
+   222→      this.fvRing = []
+   223→      for (let i = 0; i < 12; i++) {
+   224→        if (!this.win || this.win.startEpoch !== epoch) return // superseded
+   225→        const ev = await this.pm.discoverWindow(epoch)
+   226→        if (ev) {
+   227→          if (!this.win || this.win.startEpoch !== epoch) return
+   228→          this.win.upTokenId = ev.upTokenId
+   229→          this.win.downTokenId = ev.downTokenId
+   230→          this.win.conditionId = ev.conditionId
+   231→          this.win.question = ev.question
+   232→          this.win.accepting = ev.accepting
+   233→          this.win.tokensLoaded = true
+   234→          this.pm.setToken(ev.upTokenId)
+   235→          console.log(`[engine] window loaded: ${this.win.slug} strike=${strike}`)
+   236→          return
+   237→        }
+   238→        await sleep(2000)
+   239→      }
+   240→      console.log(`[engine] window NOT found after retries: btc-updown-5m-${epoch}`)
+   241→    })()
+   242→    this.loadEpochPromise = task.finally(() => {
+   243→      this.loadEpochPromise = null
+   244→    })
+   245→  }
+   246→
+   247→  private settleWindow(): void {
+   248→    const win = this.win
+   249→    if (!win) return
+   250→    const finalPrice = this.bin.mid() || this.bin.lastPrice
+   251→    for (const t of this.trades) {
+   252→      if (t.status === 'OPEN' && t.windowEnd === win.endEpoch) {
+   253→        // v0.4: flatten any residual hedge at settlement and fold its exact
+   254→        // cash-flow P&L into the combined result.
+   255→        let hedgePnl = 0
+   256→        const h = this.hedge
+   257→        if (h && h.tradeId === t.id) {
+   258→          if (!hedgeIsFlat(h)) {
+   259→            this.fillHedge(h, -h.qtyBtc, 'flatten (settlement)', Date.now(), finalPrice, finalPrice)
+   260→          }
+   261→          hedgePnl = hedgePnlAt(h, finalPrice)
+   262→          t.hedgeFills = h.fills
+   263→          t.hedgeFeesUsd = h.fees
+   264→          this.hedge = null
+   265→        }
+   266→        t.hedgePnlUsd = hedgePnl
+   267→        const won = finalPrice >= t.strike
+   268→        t.status = won ? 'WON' : 'LOST'
+   269→        t.finalPrice = finalPrice
+   270→        const binaryPnl = won ? t.shares * 1 - t.costUsd - t.feeUsd : -t.costUsd - t.feeUsd
+   271→        t.pnlUsd = binaryPnl + hedgePnl
+   272→        this.stats.pnlRealized += t.pnlUsd
+   273→        if (won) this.stats.wins++
+   274→        else this.stats.losses++
+   275→        console.log(
+   276→          `[settle] ${t.id} ${t.status} final=${finalPrice.toFixed(1)} strike=${t.strike.toFixed(1)} binary=${binaryPnl.toFixed(2)} hedge=${hedgePnl.toFixed(2)} pnl=${t.pnlUsd.toFixed(2)}`
+   277→        )
+   278→        this.onSettle?.(t)
+   279→      }
+   280→    }
+   281→  }
+   282→
+   283→  // ── hot path: recompute on every Binance/Polymarket event ──────────────────
+   284→
+   285→  private onMarketEvent(): void {
+   286→    if (!this.running) return
+   287→    this.ensureLoop() // re-arm if a hot reload discarded the tick loop
+   288→    const t0 = performance.now()
+   289→    this.evaluate()
+   290→    const us = (performance.now() - t0) * 1000
+   291→    this.decisionUsRing.push(us)
+   292→    if (this.decisionUsRing.length > 400) this.decisionUsRing.shift()
+   293→  }
+   294→
+   295→  private evaluate(): void {
+   296→    const win = this.win
+   297→    if (!win || win.strike == null || win.strike <= 0) return
+   298→    const now = Date.now()
+   299→    const tSec = (win.endEpoch * 1000 - now) / 1000
+   300→    if (tSec <= 0) return
+   301→
+   302→    const price = this.bin.mid()
+   303→    if (price <= 0) return
+   304→
+   305→    const book = this.pm.getBook()
+   306→
+   307→    // ── v0.4 σ auto-calibration ────────────────────────────────────────
+   308→    // Fold every FRESH PM book print into the calibrator (the implied σ is
+   309→    // inverted from the market's own mid; a print-time snap latches the σ
+   310→    // that makes FV equal that mid). Realized σ mirrors in continuously.
+   311→    this.cal.observeReal(this.bin.volPts)
+   312→    if (this.pm.bookVer !== this.lastCalVer) {
+   313→      this.lastCalVer = this.pm.bookVer
+   314→      const midUp = book.bid != null && book.ask != null ? (book.bid + book.ask) / 2 : null
+   315→      this.cal.observePm(
+   316→        midUp,
+   317→        null,
+   318→        price,
+   319→        win.strike,
+   320→        tSec,
+   321→        now,
+   322→        book.bookAgeMs < this.settings.maxBookAgeMs
+   323→      )
+   324→    }
+   325→    const sigmaAuto = this.settings.sigmaAuto
+   326→    this.sigmaEffNow = sigmaAuto ? this.cal.effective(now) : sigmaEff(this.bin.volPts)
+   327→
+   328→    // fair value
+   329→    let fv: number
+   330→    if (this.settings.model === 'cdf') {
+   331→      fv = fvCdfEff(price, win.strike, tSec, this.sigmaEffNow).value
+   332→    } else {
+   333→      fv = fvLinear(price, win.strike, tSec).value
+   334→    }
+   335→    this.lastFv = fv
+   336→    this.lastFvAt = now
+   337→
+   338→    // fv ring (throttled)
+   339→    const last = this.fvRing[this.fvRing.length - 1]
+   340→    if (!last || now - last.t >= FV_PUSH_MS) {
+   341→      this.fvRing.push({ t: now, v: fv })
+   342→      while (this.fvRing.length && now - this.fvRing[0].t > FV_KEEP_MS) this.fvRing.shift()
+   343→    }
+   344→
+   345→    // 5-second jump
+   346→    let ref: number | undefined
+   347→    for (let i = this.fvRing.length - 1; i >= 0; i--) {
+   348→      if (this.fvRing[i].t <= now - 5000) {
+   349→        ref = this.fvRing[i].v
+   350→        break
+   351→      }
+   352→    }
+   353→    const jump = ref == null ? 0 : fv - ref
+   354→
+   355→    // polymarket book
+   356→    const askC = book.ask
+   357→    const gapC = askC != null ? fv - askC : null
+   358→    const fresh = book.bookAgeMs < this.settings.maxBookAgeMs
+   359→
+   360→    // v0.4: net-edge decomposition (the profit gate preview) — PM taker fee
+   361→    // (fee-on-proceeds shape, live market rate wins over the knob) + the
+   362→    // estimated Binance hedge turnover cost per share.
+   363→    const pmFeeBps = this.pm.feeRateBps ?? this.settings.takerFeeBps
+   364→    const feeC = askC != null ? pmFeeCPerShare(Math.min(Math.max(askC / 100, 0.01), 0.99), pmFeeBps) : null
+   365→    const hedgeCostC = estHedgeCostC(price, win.strike, tSec, this.sigmaEffNow, this.hedgeCfg())
+   366→    const netC = gapC != null && feeC != null ? gapC - feeC - hedgeCostC : null
+   367→    this.lastNet = { feeC, hedgeCostC, netC }
+   368→
+   369→    const jumpOK = jump >= this.settings.jumpThreshC
+   370→    const floorOK = fv > this.settings.fvFloorC
+   371→    const gapOK = gapC != null && fresh && gapC >= this.settings.edgeThreshC
+   372→    const netOK = netC != null && netC >= this.settings.minNetEdgeC
+   373→    const all = jumpOK && floorOK && gapOK
+   374→    this.trig = { jump: jumpOK, above60: floorOK, gap: gapOK, all, net: netOK }
+   375→
+   376→    // v0.4 capture accounting: every rising edge of the 3-trigger conjunction
+   377→    // is an opportunity; each episode receives an explicit decision (fire or
+   378→    // a logged skip reason) — engine-side silent misses are structurally zero.
+   379→    if (all && !this.armedPrev) {
+   380→      this.armedPrev = true
+   381→      this.episodeFired = false
+   382→      this.capture.opportunities++
+   383→      if (gapC != null) this.capture.edgeSeenC += gapC
+   384→      console.log(
+   385→        `[opportunity] #${this.capture.opportunities} edge=${gapC?.toFixed(1)}¢ net=${netC?.toFixed(1)}¢ (fee ${feeC?.toFixed(1)} + hedge ${hedgeCostC.toFixed(1)})`
+   386→      )
+   387→    } else if (!all && this.armedPrev) {
+   388→      this.armedPrev = false
+   389→      if (!this.episodeFired) this.capture.missed++
+   390→    }
+   391→
+   392→    if (all) {
+   393→      this.tryFire(fv, jump, askC!, gapC!, tSec, book.askSize, netC, feeC, hedgeCostC)
+   394→    } else {
+   395→      this.logWatchOrSkip(fv, jump, gapC, jumpOK, floorOK, tSec)
+   396→    }
+   397→  }
+   398→
+   399→  /** Latest net-edge decomposition (for the snapshot / gate row). */
+   400→  private lastNet: { feeC: number | null; hedgeCostC: number; netC: number | null } = {
+   401→    feeC: null,
+   402→    hedgeCostC: 0,
+   403→    netC: null,
+   404→  }
+   405→
+   406→  private tryFire(
+   407→    fv: number,
+   408→    jump: number,
+   409→    askC: number,
+   410→    gapC: number,
+   411→    tSec: number,
+   412→    askSize: number,
+   413→    netEdgeC: number | null,
+   414→    feeC: number | null,
+   415→    hedgeCostC: number
+   416→  ): void {
+   417→    const now = Date.now()
+   418→    const win = this.win!
+   419→    if (!this.settings.autoTrade) {
+   420→      this.logSkip('auto-trade off', fv, jump, gapC, tSec)
+   421→      return
+   422→    }
+   423→    if (tSec < this.settings.minSecsLeft) {
+   424→      this.logSkip(`too close to close (${Math.max(0, tSec).toFixed(0)}s left)`, fv, jump, gapC, tSec)
+   425→      return
+   426→    }
+   427→    if (now - this.lastSignalTs < SIGNAL_COOLDOWN_MS) return
+   428→    const windowTrades = this.trades.filter((t) => t.windowEnd === win.endEpoch)
+   429→    if (windowTrades.length >= this.settings.maxTradesPerWindow) {
+   430→      this.logSkip('max trades for window', fv, jump, gapC, tSec)
+   431→      return
+   432→    }
+   433→    if (windowTrades.some((t) => t.status === 'OPEN')) {
+   434→      this.logSkip('position already open', fv, jump, gapC, tSec)
+   435→      return
+   436→    }
+   437→    if (!win.tokensLoaded) {
+   438→      this.logSkip('window book not loaded', fv, jump, gapC, tSec)
+   439→      return
+   440→    }
+   441→
+   442→    // ── v0.4 profitability gate ─────────────────────────────────────────
+   443→    // Net of the PM taker fee (live market rate, fee-on-proceeds shape) and
+   444→    // the estimated Binance hedge turnover cost, the edge must still clear
+   445→    // the floor — the strategy only trades profitable opportunities.
+   446→    if (netEdgeC == null || netEdgeC < this.settings.minNetEdgeC) {
+   447→      this.logSkip(
+   448→        `net edge ${netEdgeC?.toFixed(1) ?? '—'}¢ below ${this.settings.minNetEdgeC}¢ floor (PM fee ${feeC?.toFixed(1) ?? '—'}¢ + hedge ${hedgeCostC.toFixed(1)}¢)`,
+   449→        fv,
+   450→        jump,
+   451→        gapC,
+   452→        tSec
+   453→      )
+   454→      return
+   455→    }
+   456→
+   457→    // walk the live ask ladder ($ prices, share sizes)
+   458→    const ladder = this.pm.askLadderUsd()
+   459→    if (!ladder.length) {
+   460→      this.logSkip('no asks on book', fv, jump, gapC, tSec)
+   461→      return
+   462→    }
+   463→    const stake = this.settings.stakeUsd
+   464→    const depthUsd = ladder.reduce((a, l) => a + l.p * l.s, 0)
+   465→    if (depthUsd < stake * 0.4) {
+   466→      this.logSkip(`thin book ($${depthUsd.toFixed(0)} depth)`, fv, jump, gapC, tSec)
+   467→      return
+   468→    }
+   469→
+   470→    let cost = 0
+   471→    let shares = 0
+   472→    for (const lvl of ladder) {
+   473→      if (cost >= stake) break
+   474→      const lvlUsd = lvl.p * lvl.s
+   475→      const takeUsd = Math.min(lvlUsd, stake - cost)
+   476→      const takeShares = takeUsd / lvl.p
+   477→      shares += takeShares
+   478→      cost += takeUsd
+   479→    }
+   480→    if (shares <= 0) {
+   481→      this.logSkip('empty fill', fv, jump, gapC, tSec)
+   482→      return
+   483→    }
+   484→    const avgC = (cost / shares) * 100
+   485→    // v0.4: PM taker fee in the exchange's fee-on-proceeds shape —
+   486→    // bps/10⁴ · min(p, 1−p) per share (the live market rate wins over the knob)
+   487→    const feeBps = this.pm.feeRateBps ?? this.settings.takerFeeBps
+   488→    const fee = (shares * pmFeeCPerShare(avgC / 100, feeBps)) / 100
+   489→
+   490→    const id = `S${++this.signalSeq}-${uid()}`
+   491→    const signal: SignalLog = {
+   492→      id,
+   493→      ts: now,
+   494→      windowEnd: win.endEpoch,
+   495→      fv,
+   496→      ask: askC,
+   497→      edge: gapC,
+   498→      jump5s: jump,
+   499→      secondsLeft: tSec,
+   500→      action: 'EXECUTED',
+   501→      fillPrice: avgC,
+   502→      shares: Math.round(shares * 100) / 100,
+   503→      stake,
+   504→      reason: `edge ${gapC.toFixed(1)}¢ · net ${netEdgeC.toFixed(1)}¢ (−fee ${(gapC - netEdgeC - hedgeCostC).toFixed(1)} −hedge ${hedgeCostC.toFixed(1)}) · filled ${Math.round(shares)} sh @ ${avgC.toFixed(1)}¢`,
+   505→      netEdgeC,
+   506→      sigmaEffPts: this.sigmaEffNow,
+   507→    }
+   508→    const trade: Trade = {
+   509→      id: `T${this.signalSeq}-${uid()}`,
+   510→      signalId: id,
+   511→      ts: now,
+   512→      windowEnd: win.endEpoch,
+   513→      strike: win.strike!,
+   514→      priceC: avgC,
+   515→      shares,
+   516→      costUsd: cost,
+   517→      feeUsd: fee,
+   518→      status: 'OPEN',
+   519→      pnlUsd: null,
+   520→      finalPrice: null,
+   521→      fvAtEntry: fv,
+   522→      edgeAtEntry: gapC,
+   523→      netEdgeC,
+   524→      sigmaEffPts: this.sigmaEffNow,
+   525→    }
+   526→    this.lastSignalTs = now
+   527→    this.signals.unshift(signal)
+   528→    if (this.signals.length > 120) this.signals.pop()
+   529→    this.trades.unshift(trade)
+   530→    if (this.trades.length > 200) this.trades.pop()
+   531→    this.stats.trades++
+   532→    this.stats.stakedUsd += cost
+   533→    this.stats.edgeSum += gapC
+   534→    this.stats.edgeN++
+   535→    this.stats.triggersToday++
+   536→    this.capture.fired++
+   537→    this.episodeFired = true
+   538→    this.capture.netEdgeSum += netEdgeC
+   539→    this.capture.netEdgeN++
+   540→    console.log(
+   541→      `[SIGNAL] ${id} fv=${fv.toFixed(1)}¢ ask=${askC.toFixed(1)}¢ edge=${gapC.toFixed(1)}¢ net=${netEdgeC.toFixed(1)}¢ jump=${jump.toFixed(1)}¢ fill=${avgC.toFixed(1)}¢`
+   542→    )
+   543→    this.onSignal?.(signal)
+   544→
+   545→    // ── v0.4: open the Binance delta hedge immediately ───────────────────
+   546→    // The binary's digital delta is shorted on Binance so the combined
+   547→    // (binary + hedge) position isolates the entry mispricing. Paper fills
+   548→    // cross the live top-of-book (shorts hit the bid, covers lift the ask);
+   549→    // if the book is momentarily empty the 100ms policy tick retries.
+   550→    if (this.settings.hedgeOn) {
+   551→      this.hedge = newHedgePos(trade.id, SIDE_UP, shares, win.strike!)
+   552→      this.runHedgePolicy(now, tSec)
+   553→    }
+   554→  }
+   555→
+   556→  private logSkip(reason: string, fv: number, jump: number, gapC: number | null, tSec: number): void {
+   557→    const now = Date.now()
+   558→    if (now - (this.lastSkipLog[reason] ?? 0) < SKIP_LOG_MS) return
+   559→    this.lastSkipLog[reason] = now
+   560→    this.stats.triggersToday++
+   561→    const signal: SignalLog = {
+   562→      id: `K${++this.signalSeq}-${uid()}`,
+   563→      ts: now,
+   564→      windowEnd: this.win?.endEpoch ?? 0,
+   565→      fv,
+   566→      ask: this.pm.getBook().ask,
+   567→      edge: gapC,
+   568→      jump5s: jump,
+   569→      secondsLeft: tSec,
+   570→      action: 'SKIPPED',
+   571→      reason,
+   572→    }
+   573→    this.signals.unshift(signal)
+   574→    if (this.signals.length > 120) this.signals.pop()
+   575→    this.onSignal?.(signal)
+   576→  }
+   577→
+   578→  private logWatchOrSkip(
+   579→    fv: number,
+   580→    jump: number,
+   581→    gapC: number | null,
+   582→    jumpOK: boolean,
+   583→    floorOK: boolean,
+   584→    tSec: number
+   585→  ): void {
+   586→    const now = Date.now()
+   587→    // near-miss watch: gap approaching the threshold
+   588→    if (
+   589→      gapC != null &&
+   590→      gapC >= this.settings.edgeThreshC - 3 &&
+   591→      gapC < this.settings.edgeThreshC &&
+   592→      now - this.lastWatchLog > WATCH_LOG_MS
+   593→    ) {
+   594→      this.lastWatchLog = now
+   595→      const signal: SignalLog = {
+   596→        id: `W${++this.signalSeq}-${uid()}`,
+   597→        ts: now,
+   598→        windowEnd: this.win?.endEpoch ?? 0,
+   599→        fv,
+   600→        ask: this.pm.getBook().ask,
+   601→        edge: gapC,
+   602→        jump5s: jump,
+   603→        secondsLeft: tSec,
+   604→        action: 'WATCH',
+   605→        reason: `gap ${gapC.toFixed(1)}¢ (needs ${this.settings.edgeThreshC}¢)`,
+   606→      }
+   607→      this.signals.unshift(signal)
+   608→      if (this.signals.length > 120) this.signals.pop()
+   609→      this.onSignal?.(signal)
+   610→    }
+   611→    // trigger partially met: momentum is there, PM already repriced
+   612→    if (jumpOK && floorOK && gapC != null && gapC < this.settings.edgeThreshC) {
+   613→      this.logSkip('momentum, but PM already repriced', fv, jump, gapC, tSec)
+   614→    }
+   615→  }
+   616→
+   617→  // ── v0.4: Binance δ-hedge policy + early-exit engine ─────────────────────────
+   618→
+   619→  /** One hedge policy step (100ms cadence): W–W band re-hedge, wind-down
+   620→   *  risk-reduction, force-flatten at expiry. Paper fills cross the live
+   621→   *  Binance top-of-book; live mode sends USDT-M futures MARKET orders. */
+   622→  private runHedgePolicy(now: number, tSecOverride?: number): void {
+   623→    const h = this.hedge
+   624→    if (!h) return
+   625→    const win = this.win
+   626→    if (!win) return
+   627→    const price = this.bin.mid()
+   628→    if (price <= 0) return
+   629→    const tSec = tSecOverride ?? (win.endEpoch * 1000 - now) / 1000
+   630→    if (tSec <= 0) return
+   631→    const act = hedgeStep(h, price, this.sigmaEffNow, tSec, this.hedgeCfg())
+   632→    if (!act) return
+   633→    this.fillHedge(h, act.qty, act.reason, now, price)
+   634→  }
+   635→
+   636→  /** Paper hedge fill at the live top-of-book: shorts cross the bid, covers
+   637→   *  lift the ask. Exact cash-flow accounting. fallbackPx covers the no-book
+   638→   *  edge (settlement/exit flattens at the mark). */
+   639→  private fillHedge(
+   640→    h: HedgePos,
+   641→    qty: number,
+   642→    reason: string,
+   643→    now: number,
+   644→    mark: number,
+   645→    fallbackPx = 0
+   646→  ): void {
+   647→    let px = qty < 0 ? this.bin.bestBid : this.bin.bestAsk
+   648→    if (!px || px <= 0) px = fallbackPx
+   649→    if (!px || px <= 0) return // no live book — the next policy tick retries
+   650→    const cfg = this.hedgeCfg()
+   651→    const fee = (Math.abs(qty) * px * cfg.feeBps) / 10000
+   652→    applyHedgeFill(h, qty, px, fee)
+   653→    console.log(
+   654→      `[hedge] ${h.tradeId} ${qty < 0 ? 'SHORT' : 'COVER'} ${qty.toFixed(4)} BTC @ ${px.toFixed(1)} (${reason}) fee=$${fee.toFixed(3)} pos=${h.qtyBtc.toFixed(4)}`
+   655→    )
+   656→    this.onHedge?.({
+   657→      ts: now,
+   658→      tradeId: h.tradeId,
+   659→      qtyBtc: qty,
+   660→      px,
+   661→      feeUsd: fee,
+   662→      reason,
+   663→      posQtyBtc: h.qtyBtc,
+   664→      pnlUsd: hedgePnlAt(h, mark),
+   665→      sigmaEffPts: this.sigmaEffNow,
+   666→    })
+   667→    // mirror onto the trade row
+   668→    const t = this.trades.find((x) => x.id === h.tradeId)
+   669→    if (t) {
+   670→      if (h.fills === 1) t.hedgeQtyBtc = Math.abs(h.qtyBtc) // initial delta shorted
+   671→      t.hedgeFills = h.fills
+   672→      t.hedgeFeesUsd = h.fees
+   673→    }
+   674→  }
+   675→
+   676→  /** 100ms early-exit tick: bank the mispricing when PM re-converges. Sells
+   677→   *  the binary back at the bid (paper: walks the displayed size) and
+   678→   *  flattens the hedge — the edge is captured WITHOUT waiting for
+   679→   *  settlement and without paying into the expiry gamma explosion. */
+   680→  private exitTick(now: number, t: Trade): void {
+   681→    const s = this.settings
+   682→    if (s.minCaptureC < 0) return // exits disabled via negative capture
+   683→    const win = this.win
+   684→    if (!win || win.strike == null) return
+   685→    const tSec = (win.endEpoch * 1000 - now) / 1000
+   686→    if (tSec <= 0) return
+   687→    const bid = this.pm.getBook().bid
+   688→    if (bid == null) return
+   689→    const captured = bid - t.priceC
+   690→    const feeBps = this.pm.feeRateBps ?? s.takerFeeBps
+   691→    const exitFeeC = pmFeeCPerShare(bid / 100, feeBps)
+   692→    // reprice-exit: PM bid back within exit_band of FV AND enough edge locked
+   693→    // (≥ min_capture over entry, and ≥ 1¢ over entry after the exit fee)
+   694→    if (bid + s.exitBandC >= this.lastFv && captured >= s.minCaptureC && captured - exitFeeC >= 1.0) {
+   695→      this.executeExit(t, bid, feeBps, 'reprice-exit', now)
+   696→    }
+   697→  }
+   698→
+   699→  /** Sell the binary back at the bid and flatten the hedge. */
+   700→  private executeExit(t: Trade, bidC: number, feeBps: number, reason: string, now: number): void {
+   701→    const bidSize = this.pm.getBook().bidSize
+   702→    // paper exit fill: take the displayed size at the bid
+   703→    const fillShares = Math.min(t.shares, Math.max(bidSize, 0))
+   704→    if (fillShares < 5) return // below the 5-share order minimum — hold to settlement
+   705→    const proceeds = (fillShares * bidC) / 100
+   706→    const exitFee = (fillShares * pmFeeCPerShare(bidC / 100, feeBps)) / 100
+   707→    const mark = this.bin.mid()
+   708→    // flatten the hedge at market (paper inline; live reduce-only)
+   709→    let hedgePnl = 0
+   710→    const h = this.hedge
+   711→    if (h && h.tradeId === t.id) {
+   712→      if (!hedgeIsFlat(h)) {
+   713→        const qty = -h.qtyBtc
+   714→        this.fillHedge(h, qty, 'flatten (early exit)', now, mark, mark)
+   715→      }
+   716→      hedgePnl = hedgePnlAt(h, mark)
+   717→      t.hedgeFills = h.fills
+   718→      t.hedgeFeesUsd = h.fees
+   719→    }
+   720→    const binaryPnl = proceeds - t.costUsd - t.feeUsd - exitFee
+   721→    const total = binaryPnl + hedgePnl
+   722→    t.status = 'EXITED'
+   723→    t.exitPxC = bidC
+   724→    t.exitReason = reason
+   725→    t.hedgePnlUsd = hedgePnl
+   726→    t.pnlUsd = total
+   727→    t.finalPrice = mark
+   728→    this.stats.pnlRealized += total
+   729→    this.capture.earlyExits++
+   730→    this.hedge = null
+   731→    console.log(
+   732→      `[exit] ${t.id} EXITED @ ${bidC.toFixed(1)}¢ (entry ${t.priceC.toFixed(1)}¢) binary=${binaryPnl.toFixed(2)} hedge=${hedgePnl.toFixed(2)} net=${total.toFixed(2)}`
+   733→    )
+   734→    const sig: SignalLog = {
+   735→      id: `X${++this.signalSeq}-${uid()}`,
+   736→      ts: now,
+   737→      windowEnd: t.windowEnd,
+   738→      fv: this.lastFv,
+   739→      ask: bidC,
+   740→      edge: null,
+   741→      jump5s: this.jump5sNow(),
+   742→      secondsLeft: Math.max(0, (t.windowEnd * 1000 - now) / 1000),
+   743→      action: 'EXIT',
+   744→      reason: `banked +${(bidC - t.priceC).toFixed(1)}¢/sh early · binary ${binaryPnl.toFixed(2)} + hedge ${hedgePnl.toFixed(2)}`,
+   745→      fillPrice: bidC,
+   746→      shares: Math.round(fillShares * 100) / 100,
+   747→    }
+   748→    this.signals.unshift(sig)
+   749→    if (this.signals.length > 120) this.signals.pop()
+   750→    this.onSignal?.(sig)
+   751→    this.onSettle?.(t)
+   752→  }
+   753→
+   754→  // ── 10Hz loop: rollover, chart, snapshot ────────────────────────────────────
+   755→
+   756→  private tick(): void {
+   757→    const t0 = performance.now()
+   758→    const now = Date.now()
+   759→    this.lastTickAt = now
+   760→
+   761→    this.bin.sampleRate()
+   762→
+   763→    // window rollover
+   764→    const win = this.win
+   765→    if (win && now >= win.endEpoch * 1000 + 200) {
+   766→      this.settleWindow()
+   767→      void this.loadWindow(win.endEpoch, false)
+   768→    }
+   769→
+   770→    // ── v0.4: 100ms hedge policy tick + early-exit engine ──────────────────
+   771→    if (this.hedge && this.running) {
+   772→      const t = this.trades.find((x) => x.id === this.hedge!.tradeId && x.status === 'OPEN')
+   773→      if (t) {
+   774→        this.runHedgePolicy(now)
+   775→        this.exitTick(now, t)
+   776→      } else {
+   777→        this.hedge = null // trade closed (settled/exited) — drop the hedge
+   778→      }
+   779→    }
+   780→
+   781→    // chart point (250ms cadence)
+   782→    if (now - this.lastChartPush >= CHART_PUSH_MS && this.win?.strike != null) {
+   783→      this.lastChartPush = now
+   784→      const book = this.pm.getBook()
+   785→      const prevPt = this.chart[this.chart.length - 1]
+   786→      const pt: ChartPoint = {
+   787→        t: now,
+   788→        price: this.bin.mid(),
+   789→        bid: this.bin.bestBid,
+   790→        ask: this.bin.bestAsk,
+   791→        fv: this.lastFv,
+   792→        pmAsk: book.ask ?? prevPt?.pmAsk ?? 0,
+   793→        pmBid: book.bid ?? prevPt?.pmBid ?? 0,
+   794→        edge: book.ask != null ? this.lastFv - book.ask : (prevPt?.edge ?? 0),
+   795→      }
+   796→      if (pt.price > 0) {
+   797→        this.chart.push(pt)
+   798→        if (this.chart.length > CHART_CAP) this.chart.shift()
+   799→      }
+   800→    }
+   801→
+   802→    // feed lag mirror
+   803→    const lag = this.bin.lastLag()
+   804→    if (lag > 0) {
+   805→      this.feedLagRing.push(lag)
+   806→      if (this.feedLagRing.length > 400) this.feedLagRing.shift()
+   807→    }
+   808→
+   809→    // emit
+   810→    this.onSnap?.(this.buildSnapshot(now))
+   811→
+   812→    const us = (performance.now() - t0) * 1000
+   813→    this.tickUsRing.push(us)
+   814→    if (this.tickUsRing.length > 400) this.tickUsRing.shift()
+   815→
+   816→    // day rollover for counters
+   817→    if (now - this.stats.dayStart > 86400000) {
+   818→      this.stats.dayStart = localMidnight()
+   819→      this.stats.triggersToday = 0
+   820→    }
+   821→  }
+   822→
+   823→  // ── snapshot ────────────────────────────────────────────────────────────────
+   824→
+   825→  private pct(ring: number[], q: number): number {
+   826→    if (!ring.length) return 0
+   827→    return percentile([...ring].sort((a, b) => a - b), q)
+   828→  }
+   829→
+   830→  buildSnapshot(now = Date.now()): Snapshot {
+   831→    const win = this.win
+   832→    const book = this.pm.getBook()
+   833→    const price = this.bin.mid()
+   834→    const last = this.chart[this.chart.length - 1]
+   835→    const tSec = win ? Math.max(0, (win.endEpoch * 1000 - now) / 1000) : 0
+   836→    const dist = win?.strike != null ? price - win.strike : 0
+   837→    // FV detail: slope is the ACTIVE model's local slope (¢/pt); z/sd from the CDF
+   838→    // at the effective σ in use (auto-calibrated when σ auto-cal is on).
+   839→    let slope = 0.19
+   840→    let z = 0
+   841→    if (win?.strike != null) {
+   842→      const t = Math.max(tSec, 1)
+   843→      if (this.settings.model === 'cdf') {
+   844→        const d = fvCdfEff(price, win.strike, t, this.sigmaEffNow)
+   845→        slope = d.slope
+   846→        z = d.z
+   847→      } else {
+   848→        slope = fvLinear(price, win.strike, t).slope
+   849→        z = d0(this.bin.volPts, t, price, win.strike)
+   850→      }
+   851→    }
+   852→
+   853→    const open = this.trades.filter((t) => t.status === 'OPEN')
+   854→    let unreal = 0
+   855→    for (const t of open) {
+   856→      unreal += (t.shares * this.lastFv) / 100 - t.costUsd - t.feeUsd
+   857→    }
+   858→    // v0.4: mark the live Binance hedge into unrealized while it is open
+   859→    if (this.hedge) unreal += hedgePnlAt(this.hedge, price)
+   860→    const settled = this.stats.wins + this.stats.losses
+   861→    const edgeFvAsk = book.ask != null ? this.lastFv - book.ask : null
+   862→
+   863→    // v0.4: net-edge decomposition (profit gate preview)
+   864→    const pmFeeBps = this.pm.feeRateBps ?? this.settings.takerFeeBps
+   865→    const feeC =
+   866→      book.ask != null
+   867→        ? pmFeeCPerShare(Math.min(Math.max(book.ask / 100, 0.01), 0.99), pmFeeBps)
+   868→        : null
+   869→    const hedgeCostC =
+   870→      win?.strike != null && price > 0
+   871→        ? estHedgeCostC(price, win.strike, Math.max(tSec, 1), this.sigmaEffNow, this.hedgeCfg())
+   872→        : 0
+   873→    const netC = edgeFvAsk != null && feeC != null ? edgeFvAsk - feeC - hedgeCostC : null
+   874→
+   875→    const lastPt: ChartPoint =
+   876→      last ?? { t: now, price, bid: this.bin.bestBid, ask: this.bin.bestAsk, fv: this.lastFv, pmAsk: book.ask ?? 0, pmBid: book.bid ?? 0, edge: edgeFvAsk ?? 0 }
+   877→
+   878→    return {
+   879→      ts: now,
+   880→      running: this.running,
+   881→      feeds: {
+   882→        binance: {
+   883→          status: this.bin.status,
+   884→          latencyMs: this.bin.lastLag(),
+   885→          ticksPerMin: this.bin.ticksPerMin,
+   886→        },
+   887→        polymarket: {
+   888→          status: this.pm.status,
+   889→          updates: this.pm.updates,
+   890→          lastTradePx: this.pm.lastTradePx,
+   891→          feeRateBps: this.pm.feeRateBps,
+   892→        },
+   893→      },
+   894→      binance: {
+   895→        price,
+   896→        bid: this.bin.bestBid,
+   897→        ask: this.bin.bestAsk,
+   898→        spread: this.bin.spread(),
+   899→        change5s: this.bin.change5s(),
+   900→      },
+   901→      window: {
+   902→        startEpoch: win?.startEpoch ?? 0,
+   903→        endEpoch: win?.endEpoch ?? 0,
+   904→        secondsLeft: tSec,
+   905→        strike: win?.strike ?? null,
+   906→        strikeEstimated: win?.strikeEstimated ?? true,
+   907→        slug: win?.slug ?? '',
+   908→        question: win?.question ?? '',
+   909→        tokensLoaded: win?.tokensLoaded ?? false,
+   910→        accepting: win?.accepting ?? false,
+   911→      },
+   912→      fv: {
+   913→        value: this.lastFv,
+   914→        jump5s: this.jump5sNow(),
+   915→        model: this.settings.model,
+   916→        sigmaPts: this.bin.volPts,
+   917→        sigmaEffPts: this.sigmaEffNow,
+   918→        z,
+   919→        slope,
+   920→        distFromStrike: dist,
+   921→      },
+   922→      sigma: {
+   923→        auto: this.settings.sigmaAuto,
+   924→        imp: r1(this.cal.impVal()),
+   925→        real: r1(this.cal.realVal()),
+   926→        floor: r1(this.cal.floorVal()),
+   927→        eff: r1(this.sigmaEffNow),
+   928→        snap: this.cal.snapVal(),
+   929→        snapAgeMs: this.cal.snapAgeMs(now),
+   930→        effIsSnap: this.cal.snapped(),
+   931→        accepted: this.cal.accepted,
+   932→        rejected: this.cal.rejected,
+   933→      },
+   934→      hedge: {
+   935→        on: this.settings.hedgeOn,
+   936→        ratio: this.settings.hedgeRatio,
+   937→        feeBps: this.settings.hedgeFeeBps,
+   938→        active: !!this.hedge,
+   939→        qtyBtc: this.hedge?.qtyBtc ?? 0,
+   940→        targetBtc: this.hedge?.targetBtc ?? 0,
+   941→        bandBtc: this.hedge?.bandBtc ?? 0,
+   942→        deltaPerShare:
+   943→          win?.strike != null && price > 0 && tSec > 0
+   944→            ? digitalDeltaPerShare(price, win.strike, Math.max(tSec, 1), this.sigmaEffNow)
+   945→            : 0,
+   946→        shares: this.hedge?.shares ?? 0,
+   947→        pnlUsd: this.hedge ? hedgePnlAt(this.hedge, price) : 0,
+   948→        feesUsd: this.hedge?.fees ?? 0,
+   949→        fills: this.hedge?.fills ?? 0,
+   950→        winddown: !!this.hedge && tSec <= this.settings.hedgeWinddownS,
+   951→      },
+   952→      capture: {
+   953→        opportunities: this.capture.opportunities,
+   954→        fired: this.capture.fired,
+   955→        missed: this.capture.missed,
+   956→        edgeSeenC: r1(this.capture.edgeSeenC),
+   957→        earlyExits: this.capture.earlyExits,
+   958→        avgNetEdgeC: this.capture.netEdgeN ? this.capture.netEdgeSum / this.capture.netEdgeN : 0,
+   959→      },
+   960→      pm: {
+   961→        bid: book.bid,
+   962→        ask: book.ask,
+   963→        askSize: book.askSize,
+   964→        bidSize: book.bidSize,
+   965→        bookAgeMs: Number.isFinite(book.bookAgeMs) ? book.bookAgeMs : 999999,
+   966→        asks: book.asks,
+   967→        bids: book.bids,
+   968→      },
+   969→      edge: {
+   970→        fvAsk: edgeFvAsk,
+   971→        fvMid: book.bid != null ? this.lastFv - (book.ask! + book.bid) / 2 : null,
+   972→        feeC,
+   973→        hedgeCostC: r1(hedgeCostC),
+   974→        net: netC,
+   975→      },
+   976→      triggers: { ...this.trig, net: netC != null && netC >= this.settings.minNetEdgeC },
+   977→      stats: {
+   978→        pnlRealized: this.stats.pnlRealized,
+   979→        pnlUnrealized: unreal,
+   980→        pnlTotal: this.stats.pnlRealized + unreal,
+   981→        trades: this.stats.trades,
+   982→        open: open.length,
+   983→        wins: this.stats.wins,
+   984→        losses: this.stats.losses,
+   985→        winRate: settled ? (this.stats.wins / settled) * 100 : 0,
+   986→        avgEdgeC: this.stats.edgeN ? this.stats.edgeSum / this.stats.edgeN : 0,
+   987→        triggersToday: this.stats.triggersToday,
+   988→        stakedUsd: this.stats.stakedUsd,
+   989→      },
+   990→      latency: {
+   991→        feedP50: this.pct(this.feedLagRing, 0.5),
+   992→        feedP99: this.pct(this.feedLagRing, 0.99),
+   993→        engineUsP50: this.pct(this.tickUsRing, 0.5),
+   994→        engineUsP99: this.pct(this.tickUsRing, 0.99),
+   995→        decisionUsP50: this.pct(this.decisionUsRing, 0.5),
+   996→        decisionUsP99: this.pct(this.decisionUsRing, 0.99),
+   997→      },
+   998→      chart: lastPt,
+   999→    }
+  1000→  }
+  1001→
+  1002→  /** 5s jump recomputed for the snapshot from the fv ring. */
+  1003→  private jump5sNow(): number {
+  1004→    const now = Date.now()
+  1005→    const cur = this.fvRing[this.fvRing.length - 1]
+  1006→    if (!cur) return 0
+  1007→    let ref: number | undefined
+  1008→    for (let i = this.fvRing.length - 1; i >= 0; i--) {
+  1009→      if (this.fvRing[i].t <= now - 5000) {
+  1010→        ref = this.fvRing[i].v
+  1011→        break
+  1012→      }
+  1013→    }
+  1014→    return ref == null ? 0 : cur.v - ref
+  1015→  }
+  1016→
+  1017→  buildInit(): InitPayload {
+  1018→    const snap = this.buildSnapshot()
+  1019→    // decimate history to ≤ 720 pts
+  1020→    const hist = this.chart
+  1021→    const step = Math.max(1, Math.ceil(hist.length / 720))
+  1022→    const history = step === 1 ? [...hist] : hist.filter((_, i) => i % step === 0)
+  1023→    return {
+  1024→      snapshot: snap,
+  1025→      history,
+  1026→      signals: this.signals.slice(0, 40),
+  1027→      trades: this.trades.slice(0, 50),
+  1028→      settings: { ...this.settings },
+  1029→    }
+  1030→  }
+  1031→
+  1032→  // ── control ─────────────────────────────────────────────────────────────────
+  1033→
+  1034→  control(msg: ControlMsg): void {
+  1035→    if (msg.type === 'start') {
+  1036→      this.running = true
+  1037→      console.log('[engine] running=true')
+  1038→    } else if (msg.type === 'stop') {
+  1039→      this.running = false
+  1040→      console.log('[engine] running=false')
+  1041→    } else if (msg.type === 'reset') {
+  1042→      this.signals = []
+  1043→      this.trades = []
+  1044→      this.hedge = null
+  1045→      this.armedPrev = false
+  1046→      this.episodeFired = false
+  1047→      this.capture = {
+  1048→        opportunities: 0,
+  1049→        fired: 0,
+  1050→        missed: 0,
+  1051→        edgeSeenC: 0,
+  1052→        earlyExits: 0,
+  1053→        netEdgeSum: 0,
+  1054→        netEdgeN: 0,
+  1055→      }
+  1056→      this.stats = {
+  1057→        pnlRealized: 0,
+  1058→        trades: 0,
+  1059→        wins: 0,
+  1060→        losses: 0,
+  1061→        stakedUsd: 0,
+  1062→        edgeSum: 0,
+  1063→        edgeN: 0,
+  1064→        triggersToday: 0,
+  1065→        dayStart: localMidnight(),
+  1066→      }
+  1067→      this.chart = []
+  1068→      console.log('[engine] stats reset')
+  1069→    } else if (msg.type === 'settings' && msg.settings) {
+  1070→      // sanitize: drop null / non-finite numerics so a bad patch can't NaN
+  1071→      // the hot path
+  1072→      const patch: Partial<Settings> = {}
+  1073→      for (const [k, v] of Object.entries(msg.settings)) {
+  1074→        if (v == null) continue
+  1075→        if (typeof v === 'number' && !Number.isFinite(v)) continue
+  1076→        ;(patch as Record<string, unknown>)[k] = v
+  1077→      }
+  1078→      this.settings = { ...this.settings, ...patch }
+  1079→      // clamp the v0.4 knobs to sane ranges
+  1080→      const s = this.settings
+  1081→      s.sigmaWImp = Math.min(Math.max(s.sigmaWImp, 0), 1)
+  1082→      s.sigmaZGate = Math.min(Math.max(s.sigmaZGate, 0.05), 1.5)
+  1083→      s.sigmaFloorK = Math.min(Math.max(s.sigmaFloorK, 0.1), 2)
+  1084→      s.sigmaAbsFloor = Math.min(Math.max(s.sigmaAbsFloor, 1), 40)
+  1085→      s.hedgeRatio = Math.min(Math.max(s.hedgeRatio, 0), 1)
+  1086→      s.hedgeFeeBps = Math.min(Math.max(s.hedgeFeeBps, 0), 200)
+  1087→      s.hedgeMinBandBtc = Math.min(Math.max(s.hedgeMinBandBtc, 0.0001), 0.05)
+  1088→      s.hedgeWinddownS = Math.min(Math.max(s.hedgeWinddownS, 3), 120)
+  1089→      s.minNetEdgeC = Math.min(Math.max(s.minNetEdgeC, 0), 50)
+  1090→      s.exitBandC = Math.min(Math.max(s.exitBandC, 0), 30)
+  1091→      s.minCaptureC = Math.min(Math.max(s.minCaptureC, -1), 90)
+  1092→      this.syncSigmaCfg()
+  1093→      console.log('[engine] settings updated', JSON.stringify(patch))
+  1094→    }
+  1095→  }
+  1096→}
+  1097→

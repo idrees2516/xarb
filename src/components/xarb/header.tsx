@@ -28,11 +28,15 @@ export function Header() {
   const binLat = useXarb((s) => s.snapshot?.feeds.binance.latencyMs ?? 0)
   const pmStatus = useXarb((s) => s.snapshot?.feeds.polymarket.status ?? 'connecting')
   const running = useXarb((s) => s.snapshot?.running ?? false)
+  const focus = useXarb((s) => s.snapshot?.focus)
   const secsLeft = useXarb((s) => s.snapshot?.window.secondsLeft ?? 0)
   const strike = useXarb((s) => s.snapshot?.window.strike ?? null)
+  const marketsLive = useXarb((s) => s.snapshot?.marketsLive ?? 0)
+  const marketsTotal = useXarb((s) => s.snapshot?.marketsTotal ?? 0)
   const sigmaAuto = useXarb((s) => s.snapshot?.sigma.auto ?? true)
   const hedgeOn = useXarb((s) => s.snapshot?.hedge.on ?? false)
   const hedgeActive = useXarb((s) => s.snapshot?.hedge.active ?? false)
+  const sideDown = useXarb((s) => s.snapshot?.sideDown ?? true)
 
   return (
     <header className="sticky top-0 z-20 border-b border-[#1e222a] bg-[#0b0d11]/95 backdrop-blur">
@@ -50,7 +54,7 @@ export function Header() {
               </span>
             </div>
             <div className="hidden text-[10px] text-zinc-500 sm:block">
-              Binance BTC → Polymarket 5m UP/DOWN · latency arbitrage terminal
+              Binance → Polymarket up/down series · multi-market latency arb · both sides
             </div>
           </div>
         </div>
@@ -59,6 +63,11 @@ export function Header() {
         <div className="flex flex-wrap items-center gap-1.5">
           <FeedBadge label="BINANCE" status={binStatus} extra={binLat ? `${binLat}ms` : undefined} />
           <FeedBadge label="POLYMARKET" status={pmStatus} />
+          <FeedBadge
+            label="MARKETS"
+            status={marketsLive > 0 ? 'live' : 'down'}
+            extra={`${marketsLive}/${marketsTotal}`}
+          />
           <FeedBadge
             label="ENGINE"
             status={running ? 'live' : 'down'}
@@ -75,14 +84,22 @@ export function Header() {
             status={hedgeOn ? (hedgeActive ? 'live' : 'connecting') : 'down'}
             extra={hedgeOn ? (hedgeActive ? 'holding' : 'armed') : 'off'}
           />
+          <FeedBadge
+            label="SIDE-DOWN"
+            status={sideDown ? 'live' : 'down'}
+            extra={sideDown ? 'capture' : 'up only'}
+          />
         </div>
 
         <div className="ms-auto flex items-center gap-2">
-          {/* window chip */}
+          {/* focus window chip */}
           <div className="hidden items-center gap-2 rounded-md border border-[#262b33] bg-[#12151b] px-2.5 py-1 md:flex">
             <Radio className="h-3 w-3 text-amber-400" />
+            <span className="text-[10px] font-bold text-cyan-300">{focus?.label ?? '—'}</span>
             <span className="font-mono text-xs tabular-nums text-amber-300">{fmtCountdown(secsLeft)}</span>
-            <span className="text-[10px] text-zinc-500">to close · K {strike != null ? fmtPrice(strike, 1) : '—'}</span>
+            <span className="text-[10px] text-zinc-500">
+              to close · K {strike != null ? fmtPrice(strike, focus?.priceDp ?? 1) : '—'}
+            </span>
           </div>
 
           <button

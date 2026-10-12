@@ -185,3 +185,41 @@ Stage Summary:
 - The main Next.js terminal now carries the FULL v0.4 strategy: σ-floor auto-calibration from live PM prices, Binance δ-hedging (W–W banded), net-edge profitability gate, early-exit capture, and zero-miss capture accounting — engine + UI verified live end-to-end
 - Preview stack: supervisor bun (boot-blessed) → engine-main :3011 (clean child, XTransformPort=3011) · xarb-rs :3002 · Next :3000 · Caddy :81; all survive tool-call reaping
 - Port parity with the Rust core is test-locked: 74/74 green incl. the user's spec example
+
+---
+Task ID: 8
+Agent: main (Super Z)
+Task: v0.5 "Universe Edition" — make every setting functional, generalize the engine to ALL Polymarket up/down markets (any asset × any window, both sides), optimize full-FV-trigger capture, and surface everything in the UI (user: "make all the settings workings and heneralize this to capture all kind of markets like these and also optimize further in most advanced form to capture full fv trigger and show all of these changes on ui")
+
+Work Log:
+- Probed Polymarket gamma live: universe confirmed = 5m series × {btc, eth, sol, xrp, doge, bnb, hype} + 15m series × {btc, eth, sol, xrp} = 11 rolling markets, all accepting orders; probed Binance spot exchangeInfo: all 7 symbols TRADING with per-symbol LOT_SIZE (step/min) captured
+- Engine v0.5 (mini-services/xarb-engine):
+  - src/universe.ts (NEW): 11-series registry (slug patterns, Binance symbol map, LOT_SIZE, priceDp, warm vol), BTC-anchored σ units (1 pt = price/83200 — every existing σ knob generalizes to every asset), slugFor/specById/scaleSigmaPts helpers
+  - src/binance.ts REWRITTEN: multi-symbol combined WS (bookTicker+aggTrade per symbol) with setSymbols() live re-subscribe, per-symbol top-of-book/realized-vol-EWMA/latency/tick-rate, staggered REST fallback; onTick(sym) drives per-market evaluation
+  - src/polymarket.ts REWRITTEN: dual-token sockets — each market subscribes BOTH the UP and DOWN token (real DOWN quotes, no complement approximation), books routed by asset_id, per-side age/ladders, generalized discovery for any series/windowSec
+  - src/sigma.ts: cfg gains legacyFloor (per-market scaled); engine warm-starts σ_imp on the market's own scale at first price (setImpForTest), re-syncs on ±10% price drift
+  - src/types.ts REWRITTEN: MarketView (full per-market grid state), Snapshot gains focusId/focus/universe/marketsLive/marketsLive/sideDown/dn book/dn edge/dn triggers; Settings gains markets map, focusMarket, sideDown, hedgeMinBandBtc→hedgeMinBandUsd (USD-notional band, generalizes across assets); SignalLog/Trade/HedgeEvent carry market/marketLabel/side/asset
+  - src/engine.ts REWRITTEN (~1500 lines): per-market runtimes (feed, SigmaCalib, window, fvRing, hedge, capture, chart); event-driven evaluate per market on every Binance/PM event; FULL trigger set on BOTH sides (DOWN = mirrored: FV jump down, FV_DOWN>floor, DOWN ask under FV−edge, net-edge gate); per-market cooldown/window guards; fills walk the firing side's own ladder; hedge leg executes on the market's own Binance symbol with its LOT_SIZE; per-market rollover at its own cadence (settle → flatten hedge → roll → rediscover); applyUniverse() creates/tears down markets live (disabled-with-open-positions keep settling until flat); syncSymbols() = enabled ∪ has-open-trades; capture accounting per market AND global (zero-miss proof); snapshot = full universe grid + focus-market deep detail; control() validates/clamps the universe map + all knobs
+  - index.ts: writePid pid ?? 0 type fix
+- Frontend v0.5:
+  - lib/xarb.ts: v0.5 type mirrors; market/side-aware toasts (BUY {market} {side}, HEDGE · SHORT {asset}, settle per side); settings persist to localStorage (xarb.settings.v05) and re-apply to the engine on every (re)connect — settings now survive engine restarts; setFocusMarket/toggleMarket helpers
+  - universe.tsx (NEW): Market Universe grid — 11 rows × (τ+progress, K±EST, spot+Δ5s, FV up/dn, ask up/dn, edge up/dn, σ bp/√s, per-side ①②③④ trigger LEDs, pos chip, Δ-hedge/UP/DN armed chips); row click = focus (cyan highlight), power button = live enable/disable, marketsLive/total + opps/fired/gated summary strip; horizontal-scroll on mobile
+  - stat-cards.tsx: focus-market aware (dynamic asset/labels/dp), FV up+dn, PM up+dn, best-side edge, σ in bp/√s, hedge in focus asset units, markets live counts
+  - panels.tsx: TriggerPanel shows BOTH sides (UP block + mirrored DOWN block with dimming when side-capture off), fire banner names the firing sides; BookLadder shows UP ladder + DOWN token top strip; LatencyPanel adds symbols/sockets/universe rows
+  - feeds.tsx: signal feed + blotter gain market & side columns, hedge qty in market asset
+  - charts.tsx: focus-market labels/decimals (crosshair, strike K, price tags)
+  - header.tsx: MARKETS x/11 + SIDE-DOWN badges, focus market chip
+  - settings-sheet.tsx: NEW Market Universe section — focus select, DOWN-side capture switch, 11 series toggle grid + enable/disable all; all knobs verified wired (7 trigger + 5 σ + 5 hedge + 3 profitability sliders); hedgeMinBandUsd slider (USD notional); Restore-defaults button; all persisted
+  - page.tsx: UniversePanel at top, dynamic chart legends, footer rewritten for both-sides × 11-series rule
+- Bugs found & fixed during QA: zustand `?? []` selector fresh-array infinite loop (→ module EMPTY_UNIVERSE const); u.trig/u.dnTrig field-name TypeErrors in universe grid (→ u.triggers/u.dnTriggers; eslint didn't catch — full tsc now clean); panels null-division typing; engine writePid pid?:number
+- Verification:
+  - tsc --noEmit clean (engine + frontend); bun run lint clean (2 pre-existing warnings from the dead btc-poly-arb dir only)
+  - Engine live: 11/11 windows discovered (strikes sampled at open), combined Binance WS 7 symbols ~18k tpm, 11 PM dual-token sockets, 5m + 15m rollovers verified across multiple windows
+  - fire-probe-v05 (relaxed thresholds, then restored): FIRE on BTC 5m DOWN (fv 63.8 / ask 43.0 / edge +20.8¢ / net +2.5¢ / jump +6¢ down) → initial delta hedge BUY 0.0448 BTC (digital put direction) → 5 Whalley–Wilmott band re-hedges → early exit banked +24¢/sh → SETTLED +$0.61 (binary +5.58, hedge −4.97, fees) — value captured end-to-end on the DOWN side of the generalized engine; capture accounting 6 opps / 1 fired / 5 gated (each with explicit logged reason)
+  - Agent-browser QA via Caddy :81: 11 rows render, focus click switches all panels (verified ETH 5m header chip), power toggle tears down the feed engine-side (log: "doge-5m disabled — feed torn down") and restores, settings sheet renders every control with live values, DOWN-side toggle round-trips to the engine (settings updated {"sideDown":false}), clean reload = zero console/page errors; VLM QA desktop 6/6 checks pass, mobile 3/3 (scrollable table, clean stacking)
+- Screenshots: download/xarb-v05-dashboard.png, xarb-v05-settings.png, xarb-v05-mobile.png
+
+Stage Summary:
+- The terminal is now a generalized multi-market capture machine: 11 live Polymarket series (7×5m + 4×15m across BTC/ETH/SOL/XRP/DOGE/BNB/HYPE) × both sides, every trigger condition evaluated on every tick per market, δ-hedged on each market's own Binance symbol, σ auto-calibrated per market from that market's own PM mids (both tokens), with per-market + global zero-miss capture accounting
+- Every setting works live and survives restarts (localStorage persistence + re-apply on connect); the universe itself is a setting (focus, per-series on/off, DOWN-side capture)
+- Stack unchanged: supervisor bun → engine-main :3011 · xarb-rs :3002 · Next :3000 · Caddy :81; Rust core remains the BTC single-market v0.4 reference — porting the universe engine to xarb-rs is the natural next step

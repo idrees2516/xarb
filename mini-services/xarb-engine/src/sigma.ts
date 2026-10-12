@@ -44,9 +44,13 @@ export interface SigmaCfg {
   kappa: number
   /** Dynamic floor = floorK × median(σ_imp history). Default 0.75. */
   floorK: number
-  /** Absolute sanity floor (points/√s) — never trust σ below this. */
+  /** Absolute sanity floor (points/√s, market's own scale) — never trust σ
+   *  below this. The engine scales the BTC-anchored setting per asset. */
   absFloor: number
-  /** Hard cap (points/√s). */
+  /** Legacy-mode floor (points/√s, market's own scale) — fixed clamp of
+   *  realized σ when auto-calibration is off. */
+  legacyFloor: number
+  /** Hard cap (points/√s, market's own scale). */
   cap: number
   /** σ_imp history length for the median floor (decimated ≥250ms). */
   histCap: number
@@ -59,6 +63,7 @@ export const DEFAULT_SIGMA_CFG: SigmaCfg = {
   kappa: 0.3,
   floorK: 0.75,
   absFloor: 6.0,
+  legacyFloor: 15.5,
   cap: 90.0,
   histCap: 240,
 }
@@ -220,7 +225,7 @@ export class SigmaCalib {
    *  auto on  → clamp(max(blend, floor, snap_fresh), floor, cap). */
   effective(nowMs: number): number {
     if (!this.cfg.auto) {
-      this.eff = clamp(this.real, 15.5, this.cfg.cap)
+      this.eff = clamp(this.real, this.cfg.legacyFloor ?? 15.5, this.cfg.cap)
       this.snapBound = false
       return this.eff
     }

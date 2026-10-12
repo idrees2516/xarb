@@ -72,7 +72,7 @@ function makeSupervisor(opts: {
         stdio: ['ignore', 'pipe', 'pipe'],
       })
       store.child = child
-      writePid(opts.pidfile, child.pid, GEN)
+      writePid(opts.pidfile, child.pid ?? 0, GEN)
       // reload-eval console output is swallowed by bun --hot → tee child
       // output to a file so crashes are diagnosable
       const logPath = `${ROOT}/.zscripts/sup-${opts.label}.log`
@@ -160,3 +160,5 @@ console.log('[supervisor] xarb engine supervisor up (engine :3001 · rust :3002 
 // kick1 1791777446
 // kick3 1791777493
 // reload 1791778615
+// kick v05-universe 1791780687
+// kick2 v05-warmstart 1791780802

@@ -1,15 +1,2 @@
-.env
-.env.*
-!.env.example
-.zscripts/
-.zskills/
-xarb-rs/target/
-*.pid
-*.log
-db/
-!db/.gitkeep
-node_modules/
 skills/
-.next/
-download/
-upload/
+node_modules/

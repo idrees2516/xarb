@@ -1,7 +1,13 @@
-// ─── Polymarket live feed ─────────────────────────────────────────────────────
+// ─── Polymarket live feed (v0.5: dual-token books) ────────────────────────────
 // Direct CLOB WebSocket market channel (no middle layers) + gamma API for
-// discovery of the current 5-minute BTC UP/DOWN window. Windows are clock
-// aligned: slug = btc-updown-5m-{floor(epoch/300)*300}.
+// discovery of the current up/down window of ANY series in the universe.
+// Each market feed subscribes to BOTH tokens (UP + DOWN) on one socket:
+//   • real DOWN-side quotes (not the 100−UP complement approximation)
+//   • DOWN mids feed the σ auto-calibrator (identifiable either side)
+// Windows are clock aligned: slug = {series}-{floor(epoch/windowSec)*windowSec}.
+
+import type { MarketSpec } from './universe'
+import { slugFor } from './universe'
 
 const GAMMA = 'https://gamma-api.polymarket.com'
 const CLOB_WS = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
@@ -16,12 +22,19 @@ export interface EventInfo {
 }
 
 export type PMStatus = 'connecting' | 'live' | 'down'
+export type Side = 'up' | 'dn'
+
+interface Book {
+  buys: Map<number, number> // price$ → size (shares)
+  sells: Map<number, number>
+  lastBookAt: number
+}
 
 export class PolymarketFeed {
   status: PMStatus = 'connecting'
   updates = 0
-  /** Book version — bumped on every book-affecting event. The engine's σ
-   *  auto-calibrator folds one sample per version (fresh print detection). */
+  /** Book version — bumped on every book-affecting event (either side). The
+   *  engine's σ auto-calibrator folds one sample per version. */
   bookVer = 0
   lastTradePx: number | null = null
   feeRateBps: number | null = null
@@ -29,19 +42,24 @@ export class PolymarketFeed {
   onBook?: () => void
 
   private ws: WebSocket | null = null
-  private token: string | null = null
-  private buys = new Map<number, number>() // price$ → size (shares)
-  private sells = new Map<number, number>()
-  private lastAliveAt = 0 // any message incl PONG → dead-socket detection
-  private lastBookAt = 0 // book-affecting events only → quote freshness
+  private upToken: string | null = null
+  private dnToken: string | null = null
+  private up: Book = this.newBook()
+  private dn: Book = this.newBook()
+  private lastAliveAt = 0
   private pingTimer: any = null
   private restTimer: any = null
   private closed = false
   private reconnectTimer: any = null
 
-  async discoverWindow(epoch: number): Promise<EventInfo | null> {
+  private newBook(): Book {
+    return { buys: new Map(), sells: new Map(), lastBookAt: 0 }
+  }
+
+  /** Discover the current window event of a series at an epoch. */
+  async discoverWindow(spec: MarketSpec, epoch: number): Promise<EventInfo | null> {
     try {
-      const r = await fetch(`${GAMMA}/events?slug=btc-updown-5m-${epoch}`, {
+      const r = await fetch(`${GAMMA}/events?slug=${slugFor(spec, epoch)}`, {
         signal: AbortSignal.timeout(5000),
       })
       const j = await r.json()
@@ -60,23 +78,23 @@ export class PolymarketFeed {
         }
       }
     } catch (e) {
-      console.log('[polymarket] discover failed', String(e).slice(0, 80))
+      console.log(`[polymarket] discover failed (${spec.id})`, String(e).slice(0, 60))
     }
     return null
   }
 
   /**
-   * Switch the subscribed token (window rollover). Always opens a FRESH socket:
-   * re-subscribing on an existing connection does not reliably deliver the new
-   * token's book snapshot, while a new connection + subscribe does.
+   * Subscribe to a window's token pair (window rollover). Always opens a
+   * FRESH socket: re-subscribing on an existing connection does not reliably
+   * deliver the new tokens' book snapshots, while a new connection does.
    */
-  setToken(token: string): void {
-    if (this.token === token) return
-    this.token = token
-    this.buys.clear()
-    this.sells.clear()
+  setTokens(up: string, dn: string): void {
+    if (this.upToken === up && this.dnToken === dn) return
+    this.upToken = up
+    this.dnToken = dn
+    this.up = this.newBook()
+    this.dn = this.newBook()
     this.lastAliveAt = 0
-    this.lastBookAt = 0
     this.lastTradePx = null
     if (this.ws) {
       const old = this.ws
@@ -90,13 +108,13 @@ export class PolymarketFeed {
       } catch {
         /* noop */
       }
-      console.log('[polymarket] rolling socket for new window token')
+      console.log('[polymarket] rolling socket for new window tokens')
     }
     this.connect()
   }
 
-  currentToken(): string | null {
-    return this.token
+  tokens(): { up: string | null; dn: string | null } {
+    return { up: this.upToken, dn: this.dnToken }
   }
 
   private connect(): void {
@@ -117,8 +135,7 @@ export class PolymarketFeed {
     this.ws = ws
     ws.onopen = () => {
       this.status = 'live'
-      console.log('[polymarket] CLOB WS live')
-      if (this.token) this.subscribe(this.token)
+      if (this.upToken && this.dnToken) this.subscribe()
       this.startPing()
       this.stopRestFallback()
     }
@@ -127,9 +144,8 @@ export class PolymarketFeed {
       /* onclose follows */
     }
     ws.onclose = () => {
-      if (this.closed || this.ws !== ws) return // stale socket (rollover) — ignore
+      if (this.closed || this.ws !== ws) return // stale socket (rollover)
       this.status = 'down'
-      console.log('[polymarket] WS closed, reconnecting…')
       this.stopPing()
       this.scheduleReconnect(2000)
       this.startRestFallback()
@@ -144,9 +160,9 @@ export class PolymarketFeed {
     }, delayMs)
   }
 
-  private subscribe(token: string): void {
-    if (this.ws && this.ws.readyState === 1) {
-      this.ws.send(JSON.stringify({ assets_ids: [token], type: 'market' }))
+  private subscribe(): void {
+    if (this.ws && this.ws.readyState === 1 && this.upToken && this.dnToken) {
+      this.ws.send(JSON.stringify({ assets_ids: [this.upToken, this.dnToken], type: 'market' }))
     }
   }
 
@@ -157,7 +173,6 @@ export class PolymarketFeed {
         this.ws.send('PING')
         // dead-socket detection: no traffic of ANY kind (incl PONG) for 30s
         if (this.lastAliveAt && Date.now() - this.lastAliveAt > 30000) {
-          console.log('[polymarket] dead socket (no traffic 30s), forcing reconnect')
           try {
             this.ws.close()
           } catch {
@@ -175,6 +190,14 @@ export class PolymarketFeed {
     }
   }
 
+  /** Route a message to the book owning this asset (UP or DOWN token). */
+  private bookFor(assetId: string | undefined): Book | null {
+    if (assetId && assetId === this.upToken) return this.up
+    if (assetId && assetId === this.dnToken) return this.dn
+    if (!assetId) return this.upToken ? this.up : null
+    return null
+  }
+
   private handleRaw(raw: string): void {
     const now = Date.now()
     if (raw === 'PONG' || raw === 'PING') {
@@ -188,35 +211,37 @@ export class PolymarketFeed {
     } catch {
       return
     }
-    // messages are either arrays of events (book snapshot) or single objects
     const events: any[] = Array.isArray(msg) ? msg : [msg]
     let changed = false
     for (const d of events) {
       if (!d || !d.event_type) continue
       if (d.event_type === 'book') {
-        if (d.asset_id && this.token && d.asset_id !== this.token) continue
-        this.buys = new Map<number, number>()
-        this.sells = new Map<number, number>()
-        for (const l of d.bids ?? []) this.buys.set(+l.price, +l.size)
-        for (const l of d.asks ?? []) this.sells.set(+l.price, +l.size)
+        const b = this.bookFor(d.asset_id)
+        if (!b) continue
+        b.buys = new Map<number, number>()
+        b.sells = new Map<number, number>()
+        for (const l of d.bids ?? []) b.buys.set(+l.price, +l.size)
+        for (const l of d.asks ?? []) b.sells.set(+l.price, +l.size)
         if (d.last_trade_price) this.lastTradePx = +d.last_trade_price
-        this.lastBookAt = now
+        b.lastBookAt = now
         changed = true
       } else if (d.event_type === 'price_change') {
-        // single message may carry updates for both UP and DOWN tokens
+        // a single message may carry updates for BOTH tokens
         for (const ch of d.price_changes ?? []) {
-          if (ch.asset_id && this.token && ch.asset_id !== this.token) continue
-          const side = String(ch.side ?? '').toUpperCase() === 'BUY' ? this.buys : this.sells
+          const b = this.bookFor(ch.asset_id)
+          if (!b) continue
+          const side = String(ch.side ?? '').toUpperCase() === 'BUY' ? b.buys : b.sells
           const p = +ch.price
           const s = +ch.size
           if (!p || Number.isNaN(p)) continue
           if (!s || s <= 0) side.delete(p)
           else side.set(p, s)
-          this.lastBookAt = now
+          b.lastBookAt = now
           changed = true
         }
       } else if (d.event_type === 'last_trade_price') {
-        if (d.asset_id && this.token && d.asset_id !== this.token) continue
+        const b = this.bookFor(d.asset_id)
+        if (!b) continue
         const p = +(d.price ?? 0)
         if (p > 0) this.lastTradePx = p
         if (d.fee_rate_bps != null) this.feeRateBps = +d.fee_rate_bps
@@ -229,8 +254,8 @@ export class PolymarketFeed {
     }
   }
 
-  /** Top-of-book + ladders. Prices converted to cents. */
-  getBook(): {
+  /** Top-of-book + ladders for one side, prices in cents. */
+  getBook(side: Side): {
     bid: number | null
     ask: number | null
     bidSize: number
@@ -239,15 +264,16 @@ export class PolymarketFeed {
     bids: { p: number; s: number }[]
     bookAgeMs: number
   } {
-    const asks = [...this.sells.entries()]
+    const b = side === 'up' ? this.up : this.dn
+    const asks = [...b.sells.entries()]
       .map(([p, s]) => ({ p: +(p * 100).toFixed(1), s }))
-      .sort((a, b) => a.p - b.p)
+      .sort((x, y) => x.p - y.p)
       .slice(0, 6)
-    const bids = [...this.buys.entries()]
+    const bids = [...b.buys.entries()]
       .map(([p, s]) => ({ p: +(p * 100).toFixed(1), s }))
-      .sort((a, b) => b.p - a.p)
+      .sort((x, y) => y.p - x.p)
       .slice(0, 6)
-    const age = this.lastBookAt ? Date.now() - this.lastBookAt : Infinity
+    const age = b.lastBookAt ? Date.now() - b.lastBookAt : Infinity
     return {
       ask: asks.length ? asks[0].p : null,
       bid: bids.length ? bids[0].p : null,
@@ -259,40 +285,56 @@ export class PolymarketFeed {
     }
   }
 
-  /** Full ask ladder in $ (for book-walking fills). Sorted ascending. */
-  askLadderUsd(): { p: number; s: number }[] {
-    return [...this.sells.entries()]
+  /** Full ask ladder in $ (for book-walking fills) for one side. */
+  askLadderUsd(side: Side): { p: number; s: number }[] {
+    const b = side === 'up' ? this.up : this.dn
+    return [...b.sells.entries()]
       .map(([p, s]) => ({ p, s }))
-      .sort((a, b) => a.p - b.p)
+      .sort((x, y) => x.p - y.p)
+  }
+
+  /** Full bid ladder in $ (for early-exit sells) for one side. */
+  bidLadderUsd(side: Side): { p: number; s: number }[] {
+    const b = side === 'up' ? this.up : this.dn
+    return [...b.buys.entries()]
+      .map(([p, s]) => ({ p, s }))
+      .sort((x, y) => y.p - x.p)
   }
 
   private startRestFallback(): void {
-    if (this.restTimer || this.closed || !this.token) return
-    const token = this.token
+    if (this.restTimer || this.closed || !this.upToken) return
+    const up = this.upToken
+    const dn = this.dnToken
     this.restTimer = setInterval(async () => {
-      if ((this.status === 'live' && this.lastBookAt && Date.now() - this.lastBookAt < 5000) || this.closed) {
+      if ((this.status === 'live' && this.up.lastBookAt && Date.now() - this.up.lastBookAt < 5000) || this.closed) {
         this.stopRestFallback()
         return
       }
-      try {
-        const r = await fetch(CLOB_BOOK + token, { signal: AbortSignal.timeout(3000) })
-        const d = await r.json()
-        if (d.bids || d.asks) {
-          this.buys = new Map<number, number>()
-          this.sells = new Map<number, number>()
-          for (const l of d.bids ?? []) this.buys.set(+l.price, +l.size)
-          for (const l of d.asks ?? []) this.sells.set(+l.price, +l.size)
-          this.lastBookAt = Date.now()
-          this.lastAliveAt = Date.now()
-          this.updates++
-          this.bookVer++
-          if (this.status !== 'live') this.status = 'down'
-          this.onBook?.()
+      for (const [token, book] of [
+        [up, this.up],
+        [dn ?? '', this.dn],
+      ] as [string, Book][]) {
+        if (!token) continue
+        try {
+          const r = await fetch(CLOB_BOOK + token, { signal: AbortSignal.timeout(3000) })
+          const d = await r.json()
+          if (d.bids || d.asks) {
+            book.buys = new Map<number, number>()
+            book.sells = new Map<number, number>()
+            for (const l of d.bids ?? []) book.buys.set(+l.price, +l.size)
+            for (const l of d.asks ?? []) book.sells.set(+l.price, +l.size)
+            book.lastBookAt = Date.now()
+            this.lastAliveAt = Date.now()
+            this.updates++
+            this.bookVer++
+            if (this.status !== 'live') this.status = 'down'
+            this.onBook?.()
+          }
+        } catch {
+          /* keep retrying */
         }
-      } catch {
-        /* keep retrying */
       }
-    }, 2000)
+    }, 2500)
   }
 
   private stopRestFallback(): void {

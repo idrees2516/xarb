@@ -197,7 +197,7 @@ export function PriceChart() {
     }
   }, [])
 
-  return <canvas ref={ref} className="block h-[230px] w-full cursor-crosshair sm:h-[250px]" aria-label="BTC price chart" role="img" />
+  return <canvas ref={ref} className="block h-[230px] w-full cursor-crosshair sm:h-[250px]" aria-label="Focus market price chart" role="img" />
 }
 
 function draw(c: HTMLCanvasElement, mouse: { x: number; on: boolean }): void {
@@ -212,6 +212,8 @@ function draw(c: HTMLCanvasElement, mouse: { x: number; on: boolean }): void {
   const snap = useXarb.getState().snapshot
   const strike = snap?.window.strike ?? null
   const winEnd = snap?.window.endEpoch ?? 0
+  const dp = snap?.focus?.priceDp ?? 1
+  const asset = snap?.focus?.asset ?? 'BTC'
 
   const pts = chartBuf.filter((p) => p.t >= t0)
   if (pts.length < 2) {
@@ -252,7 +254,7 @@ function draw(c: HTMLCanvasElement, mouse: { x: number; on: boolean }): void {
     ctx.lineTo(PAD.l + plotW, py)
     ctx.stroke()
     ctx.fillStyle = C.label
-    ctx.fillText(fmtPrice(v, 0), W - PAD.r + 4, py + 3)
+    ctx.fillText(fmtPrice(v, dp > 2 ? 3 : 0), W - PAD.r + 4, py + 3)
   }
 
   // window end marker
@@ -283,7 +285,7 @@ function draw(c: HTMLCanvasElement, mouse: { x: number; on: boolean }): void {
     ctx.setLineDash([])
     ctx.fillStyle = C.strike
     ctx.textAlign = 'left'
-    ctx.fillText(`K ${fmtPrice(strike, 1)}`, PAD.l + 4, py - 4)
+    ctx.fillText(`K ${fmtPrice(strike, dp)}`, PAD.l + 4, py - 4)
   }
 
   // price line
@@ -305,7 +307,7 @@ function draw(c: HTMLCanvasElement, mouse: { x: number; on: boolean }): void {
   ctx.beginPath()
   ctx.arc(x(lastP.t), y(lastP.price), 3, 0, Math.PI * 2)
   ctx.fill()
-  tag(g, y(lastP.price), fmtPrice(lastP.price, 1), C.price)
+  tag(g, y(lastP.price), fmtPrice(lastP.price, dp), C.price)
 
   // trade markers
   markers(g, t0, t1, (tr) => {
@@ -313,7 +315,7 @@ function draw(c: HTMLCanvasElement, mouse: { x: number; on: boolean }): void {
     return p == null ? null : y(p)
   })
 
-  crosshair(g, t0, t1, mouse, (v) => [fmtClock(v.t), `BTC ${fmtPrice(v.price, 1)}`])
+  crosshair(g, t0, t1, mouse, (v) => [fmtClock(v.t), `${asset} ${fmtPrice(v.price, dp)}`])
 }
 
 // ─── fair value vs ask chart ─────────────────────────────────────────────────

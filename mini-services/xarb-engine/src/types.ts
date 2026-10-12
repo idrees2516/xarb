@@ -1,5 +1,7 @@
-// ─── XARB shared types ────────────────────────────────────────────────────────
-// Cross-exchange latency arb: Binance BTC spot → Polymarket 5m BTC UP/DOWN
+// ─── XARB shared types (v0.5 — multi-market universe) ─────────────────────────
+// Cross-exchange latency arb: Binance spot → Polymarket short-window UP/DOWN
+// series (5m + 15m × BTC/ETH/SOL/XRP/DOGE/BNB/HYPE). The engine evaluates the
+// FULL trigger set on BOTH sides of EVERY enabled market on every tick.
 
 export interface LevelC {
   p: number // price in cents (1..99)
@@ -31,9 +33,17 @@ export interface ChartPoint {
   edge: number // fv - pmAsk (¢)
 }
 
+export type SideName = 'UP' | 'DOWN'
+
 export interface SignalLog {
   id: string
   ts: number
+  /** Market id the event belongs to (e.g. 'btc-5m'). */
+  market: string
+  /** Market label (e.g. 'BTC 5m'). */
+  marketLabel: string
+  /** Token side evaluated ('UP' | 'DOWN'). */
+  side: SideName
   windowEnd: number
   fv: number
   ask: number | null
@@ -54,6 +64,12 @@ export interface Trade {
   id: string
   signalId: string
   ts: number
+  /** Market id (e.g. 'eth-5m'). */
+  market: string
+  /** Market label. */
+  marketLabel: string
+  /** Binary side held. */
+  side: SideName
   windowEnd: number
   strike: number
   priceC: number // avg fill ¢
@@ -67,10 +83,12 @@ export interface Trade {
   edgeAtEntry: number
   /** Net edge (edge − PM fee − est. hedge cost) at entry, ¢/share. */
   netEdgeC?: number | null
-  /** σ_eff at entry (pts/√s) — the auto-calibrated value used. */
+  /** σ_eff at entry (pts/√s of the market's asset). */
   sigmaEffPts?: number
-  /** Initial hedge size (BTC, abs) — the delta shorted/bought on fill. */
+  /** Initial hedge size (market asset units, abs) — the delta shorted/bought. */
   hedgeQtyBtc?: number
+  /** Hedge asset symbol (e.g. 'ETH'). */
+  hedgeAsset?: string
   /** Realized hedge P&L folded into pnlUsd (USD). */
   hedgePnlUsd?: number | null
   hedgeFeesUsd?: number
@@ -91,6 +109,13 @@ export interface Settings {
   model: 'linear' | 'cdf'
   takerFeeBps: number
   maxBookAgeMs: number
+  // ── v0.5: market universe ─────────────────────────────────────────────
+  /** Per-series enable map (universe ids → on/off). */
+  markets: Record<string, boolean>
+  /** Market id shown in the detail panels / charts. */
+  focusMarket: string
+  /** Evaluate AND fire the DOWN side (mirrored trigger set). */
+  sideDown: boolean
   // ── v0.4: σ auto-calibration from live PM prices ───────────────────
   /** Auto-calibrate σ (implied inversion + blend + dynamic floor + snap). */
   sigmaAuto: boolean
@@ -100,7 +125,8 @@ export interface Settings {
   sigmaZGate: number
   /** Dynamic floor = sigmaFloorK × median(implied-σ history). */
   sigmaFloorK: number
-  /** Absolute σ sanity floor (pts/√s). */
+  /** Absolute σ sanity floor — BTC-anchored pts/√s (1 pt = price/83200,
+   *  i.e. a *relative* unit that generalizes across every asset). */
   sigmaAbsFloor: number
   // ── v0.4: δ-hedging on Binance ─────────────────────────────────────
   hedgeOn: boolean
@@ -108,8 +134,9 @@ export interface Settings {
   hedgeRatio: number
   /** Binance taker fee (bps) in the cost model & paper P&L. */
   hedgeFeeBps: number
-  /** Minimum hedge band (BTC). */
-  hedgeMinBandBtc: number
+  /** Minimum hedge band notional (USD) — converted to the market asset's
+   *  units at the live price (generalizes the old 0.002 BTC min band). */
+  hedgeMinBandUsd: number
   /** Hedge wind-down horizon (s before close). */
   hedgeWinddownS: number
   // ── v0.4: profitability & value capture ─────────────────────────────
@@ -120,6 +147,22 @@ export interface Settings {
   exitBandC: number
   /** Minimum captured edge (¢/share over entry) for an early exit. */
   minCaptureC: number
+}
+
+/** v0.5 default universe: every discovered series is ON — the engine scans
+ *  all 11 markets (7×5m + 4×15m) on both sides, every tick. */
+const DEFAULT_MARKETS: Record<string, boolean> = {
+  'btc-5m': true,
+  'eth-5m': true,
+  'sol-5m': true,
+  'xrp-5m': true,
+  'doge-5m': true,
+  'bnb-5m': true,
+  'hype-5m': true,
+  'btc-15m': true,
+  'eth-15m': true,
+  'sol-15m': true,
+  'xrp-15m': true,
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -133,6 +176,9 @@ export const DEFAULT_SETTINGS: Settings = {
   model: 'cdf',
   takerFeeBps: 0,
   maxBookAgeMs: 3000,
+  markets: { ...DEFAULT_MARKETS },
+  focusMarket: 'btc-5m',
+  sideDown: true,
   // v0.4 defaults: PM-calibrated σ, fractional delta-hedge, profitable-only
   sigmaAuto: true,
   sigmaWImp: 0.65,
@@ -145,7 +191,7 @@ export const DEFAULT_SETTINGS: Settings = {
   // fence insures the hold at half the cost
   hedgeRatio: 0.5,
   hedgeFeeBps: 4.5,
-  hedgeMinBandBtc: 0.002,
+  hedgeMinBandUsd: 170,
   hedgeWinddownS: 20,
   minNetEdgeC: 1.5,
   exitBandC: 2.0,
@@ -156,7 +202,11 @@ export const DEFAULT_SETTINGS: Settings = {
 export interface HedgeEvent {
   ts: number
   tradeId: string
-  /** Signed fill quantity (BTC): negative = short more, positive = cover. */
+  market: string
+  marketLabel: string
+  /** Hedge asset symbol (e.g. 'BTC'). */
+  asset: string
+  /** Signed fill quantity (asset units): negative = short more, positive = cover. */
   qtyBtc: number
   px: number
   feeUsd: number
@@ -167,13 +217,133 @@ export interface HedgeEvent {
   sigmaEffPts: number
 }
 
+/** Compact per-market state for the universe grid. */
+export interface MarketView {
+  id: string
+  label: string
+  asset: string
+  binanceSym: string
+  windowSec: number
+  priceDp: number
+  enabled: boolean
+  /** live = feed connected + window loaded · loading · down · off. */
+  status: 'live' | 'loading' | 'down' | 'off'
+  window: {
+    startEpoch: number
+    endEpoch: number
+    secondsLeft: number
+    strike: number | null
+    strikeEstimated: boolean
+    slug: string
+    question: string
+    tokensLoaded: boolean
+    accepting: boolean
+  }
+  binance: {
+    price: number
+    bid: number
+    ask: number
+    spread: number
+    change5s: number
+    ticksPerMin: number
+  }
+  fv: {
+    value: number
+    valueDown: number
+    jump5s: number
+    jump5sDown: number
+    model: string
+    sigmaPts: number
+    sigmaEffPts: number
+    /** σ_eff in bp/√s (cross-asset comparable). */
+    sigmaEffBps: number
+    z: number
+    slope: number
+    distFromStrike: number
+  }
+  sigma: {
+    auto: boolean
+    imp: number
+    real: number
+    floor: number
+    eff: number
+    snap: number | null
+    snapAgeMs: number | null
+    effIsSnap: boolean
+    accepted: number
+    rejected: number
+  }
+  hedge: {
+    active: boolean
+    qtyBtc: number
+    targetBtc: number
+    bandBtc: number
+    pnlUsd: number
+    winddown: boolean
+    asset: string
+  }
+  pm: {
+    bid: number | null
+    ask: number | null
+    askSize: number
+    bidSize: number
+    bookAgeMs: number
+    /** DOWN book top. */
+    dnBid: number | null
+    dnAsk: number | null
+    dnAskSize: number
+    dnBidSize: number
+    dnBookAgeMs: number
+  }
+  edge: {
+    fvAsk: number | null
+    feeC: number | null
+    hedgeCostC: number
+    net: number | null
+    /** DOWN-side mirror. */
+    dnFvAsk: number | null
+    dnFeeC: number | null
+    dnNet: number | null
+  }
+  triggers: { jump: boolean; above60: boolean; gap: boolean; all: boolean; net: boolean }
+  dnTriggers: { jump: boolean; above60: boolean; gap: boolean; all: boolean; net: boolean }
+  capture: {
+    opportunities: number
+    fired: number
+    missed: number
+    edgeSeenC: number
+  }
+  openPos: number
+  feedStatus: string
+}
+
 export interface Snapshot {
   ts: number
   running: boolean
-  feeds: {
-    binance: { status: string; latencyMs: number; ticksPerMin: number }
-    polymarket: { status: string; updates: number; lastTradePx: number | null; feeRateBps: number | null }
+  // ── v0.5: universe ────────────────────────────────────────────────────
+  /** Id of the market the detail panels/charts follow. */
+  focusId: string
+  /** Focus market identity. */
+  focus: {
+    id: string
+    label: string
+    asset: string
+    binanceSym: string
+    windowSec: number
+    priceDp: number
   }
+  /** Every series in the universe (enabled + disabled). */
+  universe: MarketView[]
+  marketsLive: number
+  marketsTotal: number
+  /** Both-side capture enabled. */
+  sideDown: boolean
+
+  feeds: {
+    binance: { status: string; latencyMs: number; ticksPerMin: number; symbols: number }
+    polymarket: { status: string; updates: number; lastTradePx: number | null; feeRateBps: number | null; sockets: number }
+  }
+  // ── focus-market detail (legacy fields, now the focus market's data) ────
   binance: { price: number; bid: number; ask: number; spread: number; change5s: number }
   window: {
     startEpoch: number
@@ -188,7 +358,9 @@ export interface Snapshot {
   }
   fv: {
     value: number
+    valueDown: number
     jump5s: number
+    jump5sDown: number
     model: string
     sigmaPts: number
     sigmaEffPts: number
@@ -196,12 +368,12 @@ export interface Snapshot {
     slope: number
     distFromStrike: number
   }
-  /** v0.4: σ auto-calibration state (live PM implied inversion). */
+  /** v0.4: σ auto-calibration state (live PM implied inversion, focus market). */
   sigma: {
     auto: boolean
-    /** Implied σ (EWMA, pts/√s). */
+    /** Implied σ (EWMA, pts/√s of the focus asset). */
     imp: number
-    /** Realized σ (Binance 1s EWMA, pts/√s). */
+    /** Realized σ (Binance 1s EWMA, pts/√s of the focus asset). */
     real: number
     /** Dynamic floor max(abs, k·median(imp)) (pts/√s). */
     floor: number
@@ -216,7 +388,7 @@ export interface Snapshot {
     accepted: number
     rejected: number
   }
-  /** v0.4: Binance delta-hedge state. */
+  /** v0.4: Binance delta-hedge state (focus market). */
   hedge: {
     on: boolean
     ratio: number
@@ -225,15 +397,17 @@ export interface Snapshot {
     qtyBtc: number
     targetBtc: number
     bandBtc: number
-    /** Digital delta per share (BTC) at the current mark. */
+    /** Digital delta per share (market asset units) at the current mark. */
     deltaPerShare: number
     shares: number
     pnlUsd: number
     feesUsd: number
     fills: number
     winddown: boolean
+    /** Hedge asset symbol. */
+    asset: string
   }
-  /** v0.4: opportunity capture accounting (zero-miss proof). */
+  /** v0.4: opportunity capture accounting (zero-miss proof, GLOBAL). */
   capture: {
     opportunities: number
     fired: number
@@ -252,6 +426,12 @@ export interface Snapshot {
     bookAgeMs: number
     asks: LevelC[]
     bids: LevelC[]
+    /** DOWN book top (focus market). */
+    dnBid: number | null
+    dnAsk: number | null
+    dnAskSize: number
+    dnBidSize: number
+    dnBookAgeMs: number
   }
   edge: {
     fvAsk: number | null
@@ -262,8 +442,13 @@ export interface Snapshot {
     hedgeCostC: number
     /** Net edge = edge − feeC − hedgeCostC (¢/share) — the profit gate. */
     net: number | null
+    /** DOWN-side mirror. */
+    dnFvAsk: number | null
+    dnFeeC: number | null
+    dnNet: number | null
   }
   triggers: { jump: boolean; above60: boolean; gap: boolean; all: boolean; net: boolean }
+  dnTriggers: { jump: boolean; above60: boolean; gap: boolean; all: boolean; net: boolean }
   stats: {
     pnlRealized: number
     pnlUnrealized: number
@@ -290,6 +475,7 @@ export interface Snapshot {
 
 export interface InitPayload {
   snapshot: Snapshot
+  /** Chart history of the FOCUS market. */
   history: ChartPoint[]
   signals: SignalLog[]
   trades: Trade[]

@@ -1,6 +1,9 @@
 'use client'
 
-// ─── XARB client library: types, live buffers, store, socket ──────────────────
+// ─── XARB client library (v0.5): types, live buffers, store, socket ────────────
+// Multi-market universe: every panel follows the FOCUS market; the universe
+// grid shows all 11 series. Settings persist to localStorage and re-apply to
+// the engine on (re)connect so restarts never lose the operator's config.
 
 import { create } from 'zustand'
 import { io, type Socket } from 'socket.io-client'
@@ -24,9 +27,14 @@ export interface ChartPoint {
   edge: number
 }
 
+export type SideName = 'UP' | 'DOWN'
+
 export interface SignalLog {
   id: string
   ts: number
+  market: string
+  marketLabel: string
+  side: SideName
   windowEnd: number
   fv: number
   ask: number | null
@@ -38,7 +46,6 @@ export interface SignalLog {
   fillPrice?: number
   shares?: number
   stake?: number
-  /** Net edge after PM fee + hedge cost at decision time (¢/share). */
   netEdgeC?: number | null
   sigmaEffPts?: number
 }
@@ -47,6 +54,9 @@ export interface Trade {
   id: string
   signalId: string
   ts: number
+  market: string
+  marketLabel: string
+  side: SideName
   windowEnd: number
   strike: number
   priceC: number
@@ -61,6 +71,7 @@ export interface Trade {
   netEdgeC?: number | null
   sigmaEffPts?: number
   hedgeQtyBtc?: number
+  hedgeAsset?: string
   hedgePnlUsd?: number | null
   hedgeFeesUsd?: number
   hedgeFills?: number
@@ -79,6 +90,10 @@ export interface Settings {
   model: 'linear' | 'cdf'
   takerFeeBps: number
   maxBookAgeMs: number
+  // v0.5: market universe
+  markets: Record<string, boolean>
+  focusMarket: string
+  sideDown: boolean
   // v0.4: σ auto-calibration from live PM prices
   sigmaAuto: boolean
   sigmaWImp: number
@@ -89,7 +104,7 @@ export interface Settings {
   hedgeOn: boolean
   hedgeRatio: number
   hedgeFeeBps: number
-  hedgeMinBandBtc: number
+  hedgeMinBandUsd: number
   hedgeWinddownS: number
   // v0.4: profitability & value capture
   minNetEdgeC: number
@@ -108,6 +123,21 @@ export const DEFAULT_SETTINGS: Settings = {
   model: 'cdf',
   takerFeeBps: 0,
   maxBookAgeMs: 3000,
+  markets: {
+    'btc-5m': true,
+    'eth-5m': true,
+    'sol-5m': true,
+    'xrp-5m': true,
+    'doge-5m': true,
+    'bnb-5m': true,
+    'hype-5m': true,
+    'btc-15m': true,
+    'eth-15m': true,
+    'sol-15m': true,
+    'xrp-15m': true,
+  },
+  focusMarket: 'btc-5m',
+  sideDown: true,
   sigmaAuto: true,
   sigmaWImp: 0.65,
   sigmaZGate: 0.35,
@@ -116,17 +146,20 @@ export const DEFAULT_SETTINGS: Settings = {
   hedgeOn: true,
   hedgeRatio: 0.5,
   hedgeFeeBps: 4.5,
-  hedgeMinBandBtc: 0.002,
+  hedgeMinBandUsd: 170,
   hedgeWinddownS: 20,
   minNetEdgeC: 1.5,
   exitBandC: 2,
   minCaptureC: 5,
 }
 
-/** A Binance hedge fill event (initial short / re-hedge / cover / flatten). */
+/** A Binance hedge fill event (any market's asset). */
 export interface HedgeEvent {
   ts: number
   tradeId: string
+  market: string
+  marketLabel: string
+  asset: string
   qtyBtc: number
   px: number
   feeUsd: number
@@ -136,12 +169,94 @@ export interface HedgeEvent {
   sigmaEffPts: number
 }
 
+/** Compact per-market state for the universe grid. */
+export interface MarketView {
+  id: string
+  label: string
+  asset: string
+  binanceSym: string
+  windowSec: number
+  priceDp: number
+  enabled: boolean
+  status: 'live' | 'loading' | 'down' | 'off'
+  window: {
+    startEpoch: number
+    endEpoch: number
+    secondsLeft: number
+    strike: number | null
+    strikeEstimated: boolean
+    slug: string
+    question: string
+    tokensLoaded: boolean
+    accepting: boolean
+  }
+  binance: { price: number; bid: number; ask: number; spread: number; change5s: number; ticksPerMin: number }
+  fv: {
+    value: number
+    valueDown: number
+    jump5s: number
+    jump5sDown: number
+    model: string
+    sigmaPts: number
+    sigmaEffPts: number
+    sigmaEffBps: number
+    z: number
+    slope: number
+    distFromStrike: number
+  }
+  sigma: {
+    auto: boolean
+    imp: number
+    real: number
+    floor: number
+    eff: number
+    snap: number | null
+    snapAgeMs: number | null
+    effIsSnap: boolean
+    accepted: number
+    rejected: number
+  }
+  hedge: { active: boolean; qtyBtc: number; targetBtc: number; bandBtc: number; pnlUsd: number; winddown: boolean; asset: string }
+  pm: {
+    bid: number | null
+    ask: number | null
+    askSize: number
+    bidSize: number
+    bookAgeMs: number
+    dnBid: number | null
+    dnAsk: number | null
+    dnAskSize: number
+    dnBidSize: number
+    dnBookAgeMs: number
+  }
+  edge: {
+    fvAsk: number | null
+    feeC: number | null
+    hedgeCostC: number
+    net: number | null
+    dnFvAsk: number | null
+    dnFeeC: number | null
+    dnNet: number | null
+  }
+  triggers: { jump: boolean; above60: boolean; gap: boolean; all: boolean; net: boolean }
+  dnTriggers: { jump: boolean; above60: boolean; gap: boolean; all: boolean; net: boolean }
+  capture: { opportunities: number; fired: number; missed: number; edgeSeenC: number }
+  openPos: number
+  feedStatus: string
+}
+
 export interface Snapshot {
   ts: number
   running: boolean
+  focusId: string
+  focus: { id: string; label: string; asset: string; binanceSym: string; windowSec: number; priceDp: number }
+  universe: MarketView[]
+  marketsLive: number
+  marketsTotal: number
+  sideDown: boolean
   feeds: {
-    binance: { status: string; latencyMs: number; ticksPerMin: number }
-    polymarket: { status: string; updates: number; lastTradePx: number | null; feeRateBps: number | null }
+    binance: { status: string; latencyMs: number; ticksPerMin: number; symbols: number }
+    polymarket: { status: string; updates: number; lastTradePx: number | null; feeRateBps: number | null; sockets: number }
   }
   binance: { price: number; bid: number; ask: number; spread: number; change5s: number }
   window: {
@@ -157,7 +272,9 @@ export interface Snapshot {
   }
   fv: {
     value: number
+    valueDown: number
     jump5s: number
+    jump5sDown: number
     model: string
     sigmaPts: number
     sigmaEffPts: number
@@ -165,7 +282,6 @@ export interface Snapshot {
     slope: number
     distFromStrike: number
   }
-  /** v0.4: σ auto-calibration state (live PM implied inversion). */
   sigma: {
     auto: boolean
     imp: number
@@ -178,7 +294,6 @@ export interface Snapshot {
     accepted: number
     rejected: number
   }
-  /** v0.4: Binance delta-hedge state. */
   hedge: {
     on: boolean
     ratio: number
@@ -193,8 +308,8 @@ export interface Snapshot {
     feesUsd: number
     fills: number
     winddown: boolean
+    asset: string
   }
-  /** v0.4: opportunity capture accounting (zero-miss proof). */
   capture: {
     opportunities: number
     fired: number
@@ -211,6 +326,11 @@ export interface Snapshot {
     bookAgeMs: number
     asks: LevelC[]
     bids: LevelC[]
+    dnBid: number | null
+    dnAsk: number | null
+    dnAskSize: number
+    dnBidSize: number
+    dnBookAgeMs: number
   }
   edge: {
     fvAsk: number | null
@@ -218,8 +338,12 @@ export interface Snapshot {
     feeC: number | null
     hedgeCostC: number
     net: number | null
+    dnFvAsk: number | null
+    dnFeeC: number | null
+    dnNet: number | null
   }
   triggers: { jump: boolean; above60: boolean; gap: boolean; all: boolean; net: boolean }
+  dnTriggers: { jump: boolean; above60: boolean; gap: boolean; all: boolean; net: boolean }
   stats: {
     pnlRealized: number
     pnlUnrealized: number
@@ -277,17 +401,49 @@ export const useXarb = create<XarbState>((set) => ({
   snapshot: null,
   signals: [],
   trades: [],
-  settings: { ...DEFAULT_SETTINGS },
+  settings: { ...DEFAULT_SETTINGS, markets: { ...DEFAULT_SETTINGS.markets } },
 }))
+
+// ── settings persistence (survive engine restarts) ───────────────────────────
+
+const LS_KEY = 'xarb.settings.v05'
+
+function loadSaved(): Partial<Settings> | null {
+  try {
+    const raw = localStorage.getItem(LS_KEY)
+    if (!raw) return null
+    const j = JSON.parse(raw)
+    return j && typeof j === 'object' ? j : null
+  } catch {
+    return null
+  }
+}
+
+function saveSettings(s: Settings): void {
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(s))
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Reset persisted settings to defaults (Settings sheet button). */
+export function clearSavedSettings(): void {
+  try {
+    localStorage.removeItem(LS_KEY)
+  } catch {
+    /* noop */
+  }
+}
 
 // ── socket ───────────────────────────────────────────────────────────────────
 
 let socket: Socket | null = null
+let appliedSaved = false
 
 export function connectEngine(): Socket {
   if (socket) return socket
-  // 3011: the engine runs as a supervised clean child process; 3001 is held
-  // by a legacy listener inside the hot-reloaded supervisor and is unused.
+  // 3011: the engine runs as a supervised clean child process
   socket = io('/?XTransformPort=3011', {
     transports: ['websocket', 'polling'],
     forceNew: true,
@@ -296,7 +452,10 @@ export function connectEngine(): Socket {
     timeout: 10000,
   })
 
-  socket.on('connect', () => useXarb.setState({ connected: true }))
+  socket.on('connect', () => {
+    appliedSaved = false
+    useXarb.setState({ connected: true })
+  })
   socket.on('disconnect', () => useXarb.setState({ connected: false }))
 
   socket.on('init', (d: InitPayload) => {
@@ -309,6 +468,18 @@ export function connectEngine(): Socket {
       trades: d.trades ?? [],
       settings: d.settings ?? { ...DEFAULT_SETTINGS },
     })
+    // re-apply the operator's persisted settings once per connection so an
+    // engine restart never silently reverts the terminal to defaults
+    if (!appliedSaved) {
+      appliedSaved = true
+      const saved = loadSaved()
+      if (saved && Object.keys(saved).length) {
+        const merged = { ...(d.settings ?? DEFAULT_SETTINGS), ...saved }
+        useXarb.setState({ settings: merged })
+        saveSettings(merged)
+        socket?.emit('control', { type: 'settings', settings: saved })
+      }
+    }
   })
 
   socket.on('snap', (s: Snapshot) => {
@@ -324,11 +495,11 @@ export function connectEngine(): Socket {
   socket.on('signal', (sig: SignalLog) => {
     useXarb.setState((st) => ({ signals: [sig, ...st.signals].slice(0, 60) }))
     if (sig.action === 'EXECUTED' && sig.fillPrice != null) {
-      toast.success(`BUY UP filled @ ${sig.fillPrice.toFixed(1)}¢`, {
+      toast.success(`BUY ${sig.marketLabel} ${sig.side} @ ${sig.fillPrice.toFixed(1)}¢`, {
         description: `edge +${(sig.edge ?? 0).toFixed(1)}¢ · net +${(sig.netEdgeC ?? 0).toFixed(1)}¢ · jump ${sig.jump5s.toFixed(1)}¢ · ${Math.round(sig.shares ?? 0)} sh · $${sig.stake ?? 0}`,
       })
     } else if (sig.action === 'EXIT') {
-      toast.success(`EARLY EXIT · banked @ ${sig.fillPrice?.toFixed(1) ?? '—'}¢`, {
+      toast.success(`EARLY EXIT · ${sig.marketLabel} ${sig.side} @ ${sig.fillPrice?.toFixed(1) ?? '—'}¢`, {
         description: sig.reason ?? '',
       })
     }
@@ -336,8 +507,8 @@ export function connectEngine(): Socket {
 
   socket.on('hedge', (e: HedgeEvent) => {
     const short = e.qtyBtc < 0
-    toast(short ? 'HEDGE · SHORT BTC' : 'HEDGE · COVER BTC', {
-      description: `${e.qtyBtc.toFixed(4)} BTC @ ${e.px.toFixed(1)} · ${e.reason} · pos ${e.posQtyBtc.toFixed(4)} · ${e.feeUsd.toFixed(3)} fee`,
+    toast(short ? `HEDGE · SHORT ${e.asset} (${e.marketLabel})` : `HEDGE · BUY ${e.asset} (${e.marketLabel})`, {
+      description: `${e.qtyBtc} ${e.asset} @ ${e.px.toFixed(e.px > 100 ? 1 : 4)} · ${e.reason} · pos ${e.posQtyBtc} · ${e.feeUsd.toFixed(3)} fee`,
     })
   })
 
@@ -346,12 +517,12 @@ export function connectEngine(): Socket {
     const hedgeNote =
       t.hedgePnlUsd != null ? ` · hedge ${t.hedgePnlUsd >= 0 ? '+' : ''}${t.hedgePnlUsd.toFixed(2)}` : ''
     if (t.status === 'WON') {
-      toast.success(`Window settled UP · WON +$${(t.pnlUsd ?? 0).toFixed(2)}`, {
-        description: `final ${t.finalPrice?.toFixed(1)} vs strike ${t.strike.toFixed(1)}${hedgeNote}`,
+      toast.success(`${t.marketLabel} ${t.side} settled WON +$${(t.pnlUsd ?? 0).toFixed(2)}`, {
+        description: `final ${t.finalPrice?.toFixed(2)} vs strike ${t.strike.toFixed(2)}${hedgeNote}`,
       })
     } else if (t.status === 'LOST') {
-      toast.error(`Window settled DOWN · LOST $${Math.abs(t.pnlUsd ?? 0).toFixed(2)}`, {
-        description: `final ${t.finalPrice?.toFixed(1)} vs strike ${t.strike.toFixed(1)}${hedgeNote}`,
+      toast.error(`${t.marketLabel} ${t.side} settled LOST $${Math.abs(t.pnlUsd ?? 0).toFixed(2)}`, {
+        description: `final ${t.finalPrice?.toFixed(2)} vs strike ${t.strike.toFixed(2)}${hedgeNote}`,
       })
     }
   })
@@ -364,8 +535,33 @@ export function sendControl(msg: ControlMsg): void {
 }
 
 export function updateSettings(patch: Partial<Settings>): void {
-  useXarb.setState((st) => ({ settings: { ...st.settings, ...patch } }))
+  useXarb.setState((st) => {
+    const merged = { ...st.settings, ...patch }
+    saveSettings(merged)
+    return { settings: merged }
+  })
   sendControl({ type: 'settings', settings: patch })
+}
+
+/** Switch the detail panels to a market (also persisted). */
+export function setFocusMarket(id: string): void {
+  updateSettings({ focusMarket: id })
+}
+
+/** Enable/disable a series live (also persisted). */
+export function toggleMarket(id: string, on: boolean): void {
+  useXarb.setState((st) => {
+    const merged = {
+      ...st.settings,
+      markets: { ...st.settings.markets, [id]: on },
+    }
+    saveSettings(merged)
+    return { settings: merged }
+  })
+  sendControl({
+    type: 'settings',
+    settings: { markets: { [id]: on } as Record<string, boolean> },
+  })
 }
 
 // ── formatting helpers ───────────────────────────────────────────────────────
@@ -399,4 +595,10 @@ export function fmtUs(us: number): string {
   if (!Number.isFinite(us) || us <= 0) return '—'
   if (us < 1000) return `${us.toFixed(0)}µs`
   return `${(us / 1000).toFixed(2)}ms`
+}
+
+/** Compact signed number for tight table cells. */
+export function fmtSigned(v: number | null | undefined, d = 1): string {
+  if (v == null || !Number.isFinite(v)) return '—'
+  return `${v >= 0 ? '+' : ''}${v.toFixed(d)}`
 }

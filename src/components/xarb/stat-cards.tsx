@@ -18,8 +18,8 @@ function Card({
     <div className="relative overflow-hidden rounded-lg border border-[#22262e] bg-[#101318] p-3.5">
       {accent ? <div className={`absolute inset-x-0 top-0 h-[2px] ${accent}`} /> : null}
       <div className="mb-1.5 flex items-baseline justify-between gap-2">
-        <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">{title}</span>
-        {hint ? <span className="text-[9px] text-zinc-600">{hint}</span> : null}
+        <span className="truncate text-[10px] font-semibold uppercase tracking-widest text-zinc-500">{title}</span>
+        {hint ? <span className="shrink-0 text-[9px] text-zinc-600">{hint}</span> : null}
       </div>
       {children}
     </div>
@@ -42,60 +42,72 @@ function Delta({ v, suffix = '', digits = 1 }: { v: number; suffix?: string; dig
 }
 
 export function StatCards() {
-  const price = useXarb((s) => s.snapshot?.binance.price ?? null)
-  const bid = useXarb((s) => s.snapshot?.binance.bid ?? 0)
-  const ask = useXarb((s) => s.snapshot?.binance.ask ?? 0)
-  const change5s = useXarb((s) => s.snapshot?.binance.change5s ?? 0)
-  const strike = useXarb((s) => s.snapshot?.window.strike ?? null)
-  const strikeEst = useXarb((s) => s.snapshot?.window.strikeEstimated ?? true)
-  const secsLeft = useXarb((s) => s.snapshot?.window.secondsLeft ?? 0)
-  const question = useXarb((s) => s.snapshot?.window.question ?? '')
-  const fv = useXarb((s) => s.snapshot?.fv.value ?? 50)
-  const jump5s = useXarb((s) => s.snapshot?.fv.jump5s ?? 0)
-  const model = useXarb((s) => s.snapshot?.fv.model ?? 'cdf')
-  const dist = useXarb((s) => s.snapshot?.fv.distFromStrike ?? 0)
-  const slope = useXarb((s) => s.snapshot?.fv.slope ?? 0)
-  const zScore = useXarb((s) => s.snapshot?.fv.z ?? 0)
-  const sigmaEffPts = useXarb((s) => s.snapshot?.fv.sigmaEffPts ?? 15.5)
-  const pmAsk = useXarb((s) => s.snapshot?.pm.ask ?? null)
-  const pmBid = useXarb((s) => s.snapshot?.pm.bid ?? null)
-  const askSize = useXarb((s) => s.snapshot?.pm.askSize ?? 0)
-  const bookAge = useXarb((s) => s.snapshot?.pm.bookAgeMs ?? 999999)
-  const feeBps = useXarb((s) => s.snapshot?.feeds.polymarket.feeRateBps ?? null)
-  const edge = useXarb((s) => s.snapshot?.edge.fvAsk ?? null)
+  const focus = useXarb((s) => s.snapshot?.focus)
+  const bin = useXarb((s) => s.snapshot?.binance)
+  const window = useXarb((s) => s.snapshot?.window)
+  const fv = useXarb((s) => s.snapshot?.fv)
+  const pm = useXarb((s) => s.snapshot?.pm)
+  const edge = useXarb((s) => s.snapshot?.edge)
+  const stats = useXarb((s) => s.snapshot?.stats)
   const edgeThresh = useXarb((s) => s.settings.edgeThreshC)
-  const pnlTotal = useXarb((s) => s.snapshot?.stats.pnlTotal ?? 0)
-  const pnlReal = useXarb((s) => s.snapshot?.stats.pnlRealized ?? 0)
-  const pnlUnreal = useXarb((s) => s.snapshot?.stats.pnlUnrealized ?? 0)
-  const trades = useXarb((s) => s.snapshot?.stats.trades ?? 0)
-  const winRate = useXarb((s) => s.snapshot?.stats.winRate ?? 0)
-  const avgEdge = useXarb((s) => s.snapshot?.stats.avgEdgeC ?? 0)
-  const sigmaEffModel =
-    model === 'cdf'
-      ? `Φ(z) · σ_eff ${sigmaEffPts.toFixed(1)} · slope ${slope.toFixed(3)}¢/pt`
-      : `52 + slope·(S−K) · slope ${slope.toFixed(3)}¢/pt`
+  const sideDown = useXarb((s) => s.snapshot?.sideDown ?? true)
+  const marketsLive = useXarb((s) => s.snapshot?.marketsLive ?? 0)
+  const marketsTotal = useXarb((s) => s.snapshot?.marketsTotal ?? 0)
+  const feedBps = useXarb((s) => s.snapshot?.feeds.polymarket.feeRateBps ?? null)
+
+  const dp = focus?.priceDp ?? 1
+  const label = focus?.label ?? 'BTC 5m'
+  const price = bin?.price ?? null
+  const change5s = bin?.change5s ?? 0
+  const secsLeft = window?.secondsLeft ?? 0
+  const winSec = focus?.windowSec ?? 300
+  const model = fv?.model ?? 'cdf'
+  const fvVal = fv?.value ?? 50
+  const fvDn = fv?.valueDown ?? 50
+  const jump5s = fv?.jump5s ?? 0
+  const jump5sDn = fv?.jump5sDown ?? 0
+  const zScore = fv?.z ?? 0
+  const sigmaEffPts = fv?.sigmaEffPts ?? 15.5
+  const sigmaEffBps = fv?.sigmaEffBps ?? 0
+  const dist = fv?.distFromStrike ?? 0
+  const slope = fv?.slope ?? 0
+  const edgeUp = edge?.fvAsk ?? null
+  const edgeDn = edge?.dnFvAsk ?? null
 
   const edgeCls =
-    edge == null ? 'text-zinc-500' : edge >= edgeThresh ? 'text-emerald-400' : edge > 0 ? 'text-emerald-300/70' : 'text-red-400'
-  const pnlCls = pnlTotal > 0 ? 'text-emerald-400' : pnlTotal < 0 ? 'text-red-400' : 'text-zinc-400'
-  const progress = Math.min(Math.max(secsLeft / 300, 0), 1)
+    edgeUp == null
+      ? 'text-zinc-500'
+      : edgeUp >= edgeThresh
+        ? 'text-emerald-400'
+        : edgeUp > 0
+          ? 'text-emerald-300/70'
+          : 'text-red-400'
+  const pnlCls =
+    (stats?.pnlTotal ?? 0) > 0 ? 'text-emerald-400' : (stats?.pnlTotal ?? 0) < 0 ? 'text-red-400' : 'text-zinc-400'
+  const progress = Math.min(Math.max(secsLeft / winSec, 0), 1)
+  const bestEdge = Math.max(edgeUp ?? -Infinity, edgeDn ?? -Infinity)
 
   return (
     <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-      <Card title="BTC spot" hint="Binance live" accent="bg-orange-500/70">
-        <div className={`${big} text-orange-300`}>{fmtPrice(price)}</div>
+      <Card title={`${focus?.asset ?? 'BTC'} spot`} hint={`${focus?.binanceSym ?? 'BTCUSDT'} · Binance live`} accent="bg-orange-500/70">
+        <div className={`${big} text-orange-300`}>{fmtPrice(price, dp)}</div>
         <div className={sub}>
           <span>
-            {fmtPrice(bid, 1)} / {fmtPrice(ask, 1)}
+            {fmtPrice(bin?.bid ?? 0, dp)} / {fmtPrice(bin?.ask ?? 0, dp)}
           </span>
-          <Delta v={change5s} suffix=" pts" />
+          <Delta v={change5s} suffix=" pts" digits={dp} />
+        </div>
+        <div className={sub}>
+          <span className="text-zinc-600">focus market: {label}</span>
         </div>
       </Card>
 
-      <Card title="5m window" hint="UP resolves ≥ strike">
+      <Card title="window" hint={`${label} · UP resolves ≥ strike`}>
         <div className={`${big} text-zinc-100`}>
-          {strike != null ? fmtPrice(strike, 1) : '—'}
-          {strikeEst ? <span className="ms-1.5 align-middle text-[9px] font-bold text-amber-400/80">EST</span> : null}
+          {window?.strike != null ? fmtPrice(window.strike, dp) : '—'}
+          {window?.strikeEstimated ? (
+            <span className="ms-1.5 align-middle text-[9px] font-bold text-amber-400/80">EST</span>
+          ) : null}
         </div>
         <div className={sub}>
           <span className="text-amber-300">{fmtCountdown(secsLeft)}</span>
@@ -106,65 +118,88 @@ export function StatCards() {
             />
           </div>
         </div>
-        <div className="mt-1 truncate text-[9px] text-zinc-600" title={question}>
-          {question || 'discovering window…'}
+        <div className="mt-1 truncate text-[9px] text-zinc-600" title={window?.question ?? ''}>
+          {window?.question || 'discovering window…'}
         </div>
       </Card>
 
-      <Card title="UP fair value" hint={model === 'linear' ? 'linear spec model' : 'normal-cdf · σ auto-cal'} accent="bg-emerald-500/70">
-        <div className={`${big} text-emerald-300`}>{fmtCents(fv)}</div>
+      <Card
+        title="fair value up / dn"
+        hint={model === 'linear' ? 'linear spec model' : 'normal-cdf · σ auto-cal'}
+        accent="bg-emerald-500/70"
+      >
+        <div className="flex items-baseline gap-2">
+          <div className={`${big} ${fvVal >= 60 ? 'text-emerald-300' : 'text-emerald-300/80'}`}>{fmtCents(fvVal)}</div>
+          <div className={`${big} text-zinc-500`}>{fmtCents(fvDn)}</div>
+        </div>
         <div className={sub}>
           <span>5sΔ</span>
           <Delta v={jump5s} suffix="¢" />
-          <span className="text-zinc-600">K{dist >= 0 ? '+' : ''}{dist.toFixed(0)}</span>
+          <span className="text-zinc-600">dn</span>
+          <Delta v={jump5sDn} suffix="¢" />
         </div>
         <div className={sub}>
           <span className="text-zinc-600">
-            z {zScore >= 0 ? '+' : ''}{zScore.toFixed(2)}σ · {sigmaEffModel}
+            z {zScore >= 0 ? '+' : ''}
+            {zScore.toFixed(2)}σ · σ_eff {sigmaEffBps.toFixed(1)}bp/√s · slope {slope.toFixed(3)}¢/pt
           </span>
         </div>
         <div className={sub}>
-          <span className="text-zinc-600">{model === 'linear' ? 'legacy spec curve' : 'Φ(z) · bounded 1–99¢ · honest tails'}</span>
+          <span className="text-zinc-600">
+            {model === 'linear' ? 'legacy spec curve' : 'Φ(z) both sides · bounded 1–99¢'}
+          </span>
         </div>
       </Card>
 
-      <Card title="Polymarket UP" hint="CLOB top of book">
-        <div className={`${big} text-amber-300`}>{fmtCents(pmAsk)}</div>
-        <div className={sub}>
-          <span>bid {fmtCents(pmBid)}</span>
-          <span>sz {Math.round(askSize)}</span>
-          <span className={bookAge > 3000 ? 'text-red-400' : 'text-zinc-500'}>age {bookAge > 99999 ? '—' : `${Math.round(bookAge)}ms`}</span>
+      <Card title="Polymarket up / dn" hint="CLOB top of book">
+        <div className="flex items-baseline gap-2">
+          <div className={`${big} text-amber-300`}>{fmtCents(pm?.ask)}</div>
+          <div className={`${big} text-amber-300/50`}>{fmtCents(pm?.dnAsk)}</div>
         </div>
         <div className={sub}>
-          <span className="text-zinc-600">live taker fee {feeBps != null ? `${feeBps} bps` : '—'}</span>
+          <span>bid {fmtCents(pm?.bid)}</span>
+          <span>dn bid {fmtCents(pm?.dnBid)}</span>
+          <span>sz {Math.round(pm?.askSize ?? 0)}</span>
+          <span className={(pm?.bookAgeMs ?? 9e9) > 3000 ? 'text-red-400' : 'text-zinc-500'}>
+            age {pm && pm.bookAgeMs > 99999 ? '—' : `${Math.round(pm?.bookAgeMs ?? 0)}ms`}
+          </span>
+        </div>
+        <div className={sub}>
+          <span className="text-zinc-600">live taker fee {feedBps != null ? `${feedBps} bps` : '—'} · both tokens subscribed</span>
         </div>
       </Card>
 
-      <Card title="Edge · FV − ask" hint={`fires ≥ ${edgeThresh}¢`}>
-        <div className={`${big} ${edgeCls}`}>{edge == null ? '—' : `${edge >= 0 ? '+' : ''}${edge.toFixed(1)}¢`}</div>
+      <Card title="Edge · FV − ask" hint={`fires ≥ ${edgeThresh}¢ · best side`}>
+        <div className={`${big} ${bestEdge === edgeDn && sideDown ? 'text-cyan-300' : edgeCls}`}>
+          {bestEdge === -Infinity ? '—' : `${bestEdge >= 0 ? '+' : ''}${bestEdge.toFixed(1)}¢`}
+        </div>
+        <div className={sub}>
+          <span>up {edgeUp == null ? '—' : fmtCents(edgeUp)}</span>
+          <span className="text-zinc-600">dn</span>
+          <span className={sideDown ? 'text-zinc-400' : 'text-zinc-600 line-through'}>
+            {edgeDn == null ? '—' : fmtCents(edgeDn)}
+          </span>
+        </div>
         <div className={sub}>
           <div className="h-1.5 flex-1 overflow-hidden rounded bg-[#1a1e25]">
             <div
-              className={`h-full rounded ${edge != null && edge >= edgeThresh ? 'bg-emerald-400' : 'bg-emerald-400/30'}`}
-              style={{ width: `${Math.min(Math.max((edge ?? 0) / edgeThresh, 0), 1) * 100}%` }}
+              className={`h-full rounded ${bestEdge >= edgeThresh ? 'bg-emerald-400' : 'bg-emerald-400/30'}`}
+              style={{ width: `${Math.min(Math.max(bestEdge / edgeThresh, 0), 1) * 100}%` }}
             />
           </div>
-          <span className="text-zinc-600">{Math.max(0, edgeThresh - (edge ?? 0)).toFixed(1)}¢ to go</span>
-        </div>
-        <div className={sub}>
-          <span className="text-zinc-600">gap opens when PM reprices slower than Binance</span>
+          <span className="text-zinc-600">{Math.max(0, edgeThresh - bestEdge).toFixed(1)}¢ to go</span>
         </div>
       </Card>
 
-      <Card title="Session P&L" hint="paper · hedged">
-        <div className={`${big} ${pnlCls}`}>{fmtPnl(pnlTotal)}</div>
+      <Card title="Session P&L" hint={`paper · all ${marketsLive}/${marketsTotal} markets`}>
+        <div className={`${big} ${pnlCls}`}>{fmtPnl(stats?.pnlTotal ?? 0)}</div>
         <div className={sub}>
-          <span>real {fmtPnl(pnlReal)}</span>
-          <span>open {fmtPnl(pnlUnreal)}</span>
+          <span>real {fmtPnl(stats?.pnlRealized ?? 0)}</span>
+          <span>open {fmtPnl(stats?.pnlUnrealized ?? 0)}</span>
         </div>
         <div className={sub}>
           <span className="text-zinc-600">
-            {trades} trades · {winRate.toFixed(0)}% win · avg {avgEdge.toFixed(1)}¢ edge
+            {stats?.trades ?? 0} trades · {(stats?.winRate ?? 0).toFixed(0)}% win · avg {(stats?.avgEdgeC ?? 0).toFixed(1)}¢ edge
           </span>
         </div>
       </Card>
@@ -172,7 +207,7 @@ export function StatCards() {
   )
 }
 
-// ─── v0.4 row: σ auto-calibration · δ-hedge · value capture ───────────────────
+// ─── v0.4/v0.5 row: σ auto-calibration · δ-hedge · value capture ──────────────
 
 export function V04Cards() {
   const sigma = useXarb((s) => s.snapshot?.sigma)
@@ -180,36 +215,44 @@ export function V04Cards() {
   const capture = useXarb((s) => s.snapshot?.capture)
   const netEdge = useXarb((s) => s.snapshot?.edge.net ?? null)
   const minNetEdge = useXarb((s) => s.settings.minNetEdgeC)
+  const focus = useXarb((s) => s.snapshot?.focus)
+  const marketsLive = useXarb((s) => s.snapshot?.marketsLive ?? 0)
+  const spot = useXarb((s) => s.snapshot?.binance.price ?? 0)
 
+  const asset = hedge?.asset ?? focus?.asset ?? 'BTC'
   const snapFresh = !!sigma?.effIsSnap
   const snapAge = sigma?.snapAgeMs
   const capRatio =
     capture && capture.edgeSeenC > 1 && capture.fired > 0
       ? Math.min((capture.avgNetEdgeC * capture.fired) / capture.edgeSeenC, 1.5)
       : null
+  const sigmaBps = sigma && spot > 0 ? (sigma.eff / spot) * 1e4 : null
 
   return (
     <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
       {/* σ auto-calibration */}
       <Card
         title="σ auto-calibration"
-        hint={sigma?.auto ? 'from live PM mids' : 'legacy fixed floor'}
+        hint={sigma?.auto ? `from live PM mids · ${focus?.label ?? ''}` : 'legacy fixed floor'}
         accent="bg-cyan-500/70"
       >
         <div className="flex items-baseline gap-2">
           <Sigma className="h-4 w-4 text-cyan-400/70" />
           <div className={`${big} text-cyan-300`}>
-            {sigma ? sigma.eff.toFixed(1) : '—'}
+            {sigma ? sigma.eff.toFixed(2) : '—'}
             <span className="ms-1 text-[10px] font-normal text-zinc-500">pts/√s</span>
           </div>
+          {sigmaBps != null ? (
+            <span className="font-mono text-[10px] tabular-nums text-zinc-500">{sigmaBps.toFixed(1)} bp/√s</span>
+          ) : null}
         </div>
         <div className={sub}>
           <span className="text-zinc-600">imp</span>
-          <span className="text-cyan-200/90">{sigma ? sigma.imp.toFixed(1) : '—'}</span>
+          <span className="text-cyan-200/90">{sigma ? sigma.imp.toFixed(2) : '—'}</span>
           <span className="text-zinc-600">real</span>
-          <span>{sigma ? sigma.real.toFixed(1) : '—'}</span>
+          <span>{sigma ? sigma.real.toFixed(2) : '—'}</span>
           <span className="text-zinc-600">floor</span>
-          <span>{sigma ? sigma.floor.toFixed(1) : '—'}</span>
+          <span>{sigma ? sigma.floor.toFixed(2) : '—'}</span>
         </div>
         <div className={sub}>
           {sigma?.auto ? (
@@ -240,8 +283,8 @@ export function V04Cards() {
         <div className="flex items-baseline gap-2">
           <ShieldHalf className="h-4 w-4 text-fuchsia-400/70" />
           <div className={`${big} ${hedge?.active ? 'text-fuchsia-300' : 'text-zinc-500'}`}>
-            {hedge?.active ? `${hedge.qtyBtc.toFixed(4)}` : 'FLAT'}
-            {hedge?.active ? <span className="ms-1 text-[10px] font-normal text-zinc-500">BTC</span> : null}
+            {hedge?.active ? `${hedge.qtyBtc}` : 'FLAT'}
+            {hedge?.active ? <span className="ms-1 text-[10px] font-normal text-zinc-500">{asset}</span> : null}
           </div>
           {hedge?.winddown && hedge?.active ? (
             <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1 py-px text-[9px] font-bold text-amber-400">
@@ -251,11 +294,11 @@ export function V04Cards() {
         </div>
         <div className={sub}>
           <span className="text-zinc-600">target</span>
-          <span className="text-fuchsia-200/90">{hedge ? hedge.targetBtc.toFixed(4) : '—'}</span>
-          <span className="text-zinc-600">band ±{hedge ? hedge.bandBtc.toFixed(4) : '—'}</span>
+          <span className="text-fuchsia-200/90">{hedge ? hedge.targetBtc : '—'}</span>
+          <span className="text-zinc-600">band ±{hedge ? hedge.bandBtc : '—'}</span>
         </div>
         <div className={sub}>
-          <span className="text-zinc-600">Δ/sh {hedge ? hedge.deltaPerShare.toFixed(4) : '—'} BTC</span>
+          <span className="text-zinc-600">Δ/sh {hedge ? hedge.deltaPerShare.toFixed(5) : '—'} {asset}</span>
           <span className={hedge?.active ? 'text-zinc-400' : 'text-zinc-600'}>
             {hedge?.shares ? `${Math.round(hedge.shares)} sh` : ''}
           </span>
@@ -267,7 +310,7 @@ export function V04Cards() {
       </Card>
 
       {/* value capture */}
-      <Card title="Value capture" hint="zero engine-miss" accent="bg-emerald-500/70">
+      <Card title="Value capture" hint="zero engine-miss · whole universe" accent="bg-emerald-500/70">
         <div className="flex items-baseline gap-2">
           <Crosshair className="h-4 w-4 text-emerald-400/70" />
           <div className={`${big} ${netEdge != null && netEdge >= minNetEdge ? 'text-emerald-300' : 'text-zinc-200'}`}>
@@ -277,7 +320,7 @@ export function V04Cards() {
         </div>
         <div className={sub}>
           <span className="text-zinc-600">
-            edge − PM fee − hedge cost · fires ≥ {minNetEdge}¢ — the profit gate
+            edge − PM fee − hedge cost · fires ≥ {minNetEdge}¢ — the profit gate ({focus?.label ?? ''})
           </span>
         </div>
         <div className={sub}>
@@ -292,7 +335,10 @@ export function V04Cards() {
         </div>
         <div className={sub}>
           <span className="text-zinc-600">
-            edge seen {(capture?.edgeSeenC ?? 0).toFixed(0)}¢ · avg net {capture && capture.fired > 0 ? `${capture.avgNetEdgeC >= 0 ? '+' : ''}${capture.avgNetEdgeC.toFixed(1)}¢` : '—'}
+            {marketsLive} markets · edge seen {(capture?.edgeSeenC ?? 0).toFixed(0)}¢ · avg net{' '}
+            {capture && capture.fired > 0
+              ? `${capture.avgNetEdgeC >= 0 ? '+' : ''}${capture.avgNetEdgeC.toFixed(1)}¢`
+              : '—'}
             {capRatio != null ? ` · capture ${(capRatio * 100).toFixed(0)}%` : ''}
           </span>
         </div>
