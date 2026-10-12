@@ -12,6 +12,7 @@ xarb-core = { path = "../xarb-core" }
 xarb-hft = { path = "../xarb-hft" }
 xarb-engine = { path = "../xarb-engine" }
 xarb-poly = { path = "../xarb-poly" }
+xarb-feed = { path = "../xarb-feed" }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }

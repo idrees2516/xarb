@@ -212,6 +212,17 @@ impl QuoteCell {
             Some(a)
         }
     }
+
+    /// Bid in cents, None when absent.
+    #[inline]
+    pub fn bid_opt(&self) -> Option<u16> {
+        let b = self.bid_c();
+        if b == NO_ASK {
+            None
+        } else {
+            Some(b)
+        }
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,9 @@ pub struct ColdState {
     pub signals: Vec<SignalLog>,
     pub trades: Vec<Trade>,
     pub chart: Vec<ChartPoint>,
+    /// v0.4: live delta-hedge position for the open trade (None when flat
+       /// / no position). Single-position risk gate keeps this unambiguous.
+    pub hedge: Option<crate::hedger::HedgePos>,
 }
 
 impl Default for ColdState {
@@ -25,6 +28,7 @@ impl Default for ColdState {
             signals: Vec::new(),
             trades: Vec::new(),
             chart: Vec::new(),
+            hedge: None,
         }
     }
 }
@@ -39,8 +43,11 @@ pub fn publish_window(hot: &Arc<crate::hotcore::HotShared>, strike: f64, end_ms:
 }
 
 /// Settle OPEN trades of the closing window (UP wins on final ≥ strike;
-/// DOWN wins on final < strike — symmetric payoff).
-pub fn settle_window(eng: &crate::Engine) {
+/// DOWN wins on final < strike — symmetric payoff) and fold the Binance
+/// delta-hedge P&L into the combined trade result. If the hedge is still
+/// open at settlement (live order in flight), a reduce-only flatten is
+/// issued and the trade row is finalized when the fill lands.
+pub async fn settle_window(eng: &Arc<crate::Engine>) {
     let end_epoch = { eng.cold.lock().unwrap().window.end_epoch };
     let full = eng.hot.full.load_full();
     let final_price = full.price;
@@ -53,7 +60,7 @@ pub fn settle_window(eng: &crate::Engine) {
     let mut pnls: Vec<f64> = Vec::new();
     {
         let mut cold = eng.cold.lock().unwrap();
-        let ColdState { stats, trades, .. } = &mut *cold;
+        let ColdState { stats, trades, hedge, .. } = &mut *cold;
         for t in trades.iter_mut() {
             if t.status != "OPEN" || t.window_end != end_epoch {
                 continue;
@@ -65,19 +72,34 @@ pub fn settle_window(eng: &crate::Engine) {
             };
             t.status = if won { "WON" } else { "LOST" };
             t.final_price = Some(final_price);
-            let pnl = if won {
+            t.exit_reason = "settlement".into();
+            let binary_pnl = if won {
                 t.shares - t.cost_usd - t.fee_usd
             } else {
                 -t.cost_usd - t.fee_usd
             };
+            // fold the hedge mark into the combined result (paper: already
+            // flat — force-flatten at τ≤3s guarantees it; live: mark now,
+            // finalize on the late flatten fill)
+            if let Some(h) = hedge.as_ref() {
+                if h.trade_id == t.id {
+                    t.hedge_qty_btc = h.qty_btc;
+                    t.hedge_pnl_usd = h.pnl_at(final_price);
+                    t.hedge_fees_usd = h.fees;
+                    stats.hedge_fees_usd += h.fees;
+                }
+            }
+            let pnl = binary_pnl + t.hedge_pnl_usd;
             t.pnl_usd = Some(pnl);
             println!(
-                "[settle] {} {} {} final={} strike={} pnl={:.2}",
+                "[settle] {} {} {} final={} strike={} binary={:+.2} hedge={:+.2} net={:+.2}",
                 t.id,
                 side_str(t.side),
                 t.status,
                 final_price,
                 t.strike,
+                binary_pnl,
+                t.hedge_pnl_usd,
                 pnl
             );
             stats.pnl_realized += pnl;
@@ -95,6 +117,16 @@ pub fn settle_window(eng: &crate::Engine) {
             .daily_pnl_c
             .fetch_add((pnl * 100.0).round() as i64, Ordering::Relaxed);
         eng.risk.open_trades.fetch_sub(1, Ordering::Relaxed);
+    }
+    // late live flatten: if a hedge is still open for a settled trade,
+    // issue a reduce-only flatten now; the fill callback finalizes the row
+    if let Some(h) = eng.cold.lock().unwrap().hedge.clone() {
+        if !h.is_flat() {
+            let eng2 = eng.clone();
+            tokio::spawn(async move {
+                crate::cold::force_flatten_hedge(&eng2, h.trade_id.clone()).await;
+            });
+        }
     }
     // daily-loss kill switch
     {
@@ -198,14 +230,14 @@ pub async fn manage_window(eng: Arc<crate::Engine>, epoch: u64) {
 }
 
 /// Cold-tick housekeeping: rollover detection + chart point.
-pub fn cold_tick(eng: &Arc<crate::Engine>) {
+pub async fn cold_tick(eng: &Arc<crate::Engine>) {
     let now = now_ms();
 
     // window rollover
     {
         let end_epoch = { eng.cold.lock().unwrap().window.end_epoch };
         if end_epoch > 0 && now >= end_epoch * 1000 + 200 {
-            settle_window(eng);
+            settle_window(eng).await;
             eng.risk.reset_window((end_epoch + 300) * 1000);
             let eng2 = eng.clone();
             tokio::spawn(async move {

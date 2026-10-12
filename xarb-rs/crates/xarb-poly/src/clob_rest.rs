@@ -2,7 +2,7 @@
 //! marketable BUY order posting, and per-token tick-size / fee-rate lookup.
 
 use crate::eip712::{
-    addr_to_hex, build_buy_order, clob_auth_signature, l2_headers, Creds, RawOrder,
+    addr_to_hex, build_buy_order, build_sell_order, clob_auth_signature, l2_headers, Creds, RawOrder,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use k256::ecdsa::SigningKey;
@@ -224,6 +224,52 @@ impl ClobClient {
         let ts = now_sec();
         let headers = l2_headers(creds, &self.address_hex, "POST", path, &body, ts);
 
+        let mut req = self
+            .http
+            .post(format!("{CLOB_HOST}{path}"))
+            .header("Content-Type", "application/json")
+            .body(body.clone());
+        for (k, v) in headers {
+            req = req.header(&k, &v);
+        }
+        let resp = req
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await
+            .context("order request failed")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("order HTTP {status}: {text}");
+        }
+        let j: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let id = j["orderID"].as_str().unwrap_or("").to_string();
+        let st = j["status"].as_str().unwrap_or("unknown").to_string();
+        Ok((id, st, text))
+    }
+
+    /// Submit a signed marketable FOK SELL order (early exit / flatten).
+    /// Same auth path as the BUY; price floors to the tick grid so it
+    /// crosses the bid. Returns (orderID, status, raw response).
+    pub async fn post_sell_order(
+        &self,
+        token_id_dec: &str,
+        price_dollars: f64,
+        size_shares: f64,
+        neg_risk: bool,
+    ) -> Result<(String, String, String)> {
+        let sk = self.sk.as_ref().ok_or_else(|| anyhow!("paper client"))?;
+        let tick = self.tick_size(token_id_dec).await?;
+        let fee = self.fee_rate_bps(token_id_dec).await?;
+        let order: RawOrder = build_sell_order(token_id_dec, price_dollars, size_shares, self.address, tick, fee)
+            .map_err(|e| anyhow!("order build: {e}"))?;
+        let creds = self.creds.as_ref().ok_or_else(|| anyhow!("no L2 creds"))?;
+        let body = order
+            .signed_body(sk, neg_risk, &creds.api_key, "FOK")
+            .map_err(|e| anyhow!("order sign: {e}"))?;
+        let path = "/order";
+        let ts = now_sec();
+        let headers = l2_headers(creds, &self.address_hex, "POST", path, &body, ts);
         let mut req = self
             .http
             .post(format!("{CLOB_HOST}{path}"))

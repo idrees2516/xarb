@@ -24,15 +24,17 @@
 
 pub mod cold;
 pub mod executor;
+pub mod hedger;
 pub mod hotcore;
 pub mod snapshot;
 pub mod state;
 pub mod strategy;
 pub mod window;
 
+pub use hedger::{apply_fill as apply_hedge_fill, est_hedge_cost_c, hedge_step, pm_fee_c_per_share, HedgeAction, HedgeCfg, HedgePos};
 pub use hotcore::{FvCore, FvFull, HotShared};
 pub use state::{
-    ChartPoint, EngineConfig, FillEvent, FireIntent, LatencyStats, RiskState, Settings,
+    ChartPoint, EngineConfig, FillEvent, FireIntent, HedgeFill, LatencyStats, RiskState, Settings,
     SignalEvt, SignalLog, Stats, Trade, Window, SIDE_DOWN, SIDE_UP,
 };
 pub use window::ColdState;
@@ -89,6 +91,7 @@ impl PinPlan {
 struct Channels {
     signal: tokio::sync::mpsc::UnboundedSender<SignalEvt>,
     fill: tokio::sync::mpsc::UnboundedSender<FillEvent>,
+    hedge: tokio::sync::mpsc::UnboundedSender<HedgeFill>,
 }
 
 pub struct Engine {
@@ -110,6 +113,10 @@ pub struct Engine {
     // io / external
     pub token_tx: watch::Sender<Option<(String, String)>>,
     pub clob: Arc<tokio::sync::Mutex<ClobClient>>,
+    /// Binance USDT-M futures client for the live delta-hedge leg (None in
+    /// paper mode — paper hedge fills simulate against the live Binance
+    /// top-of-book).
+    pub fapi: Option<Arc<xarb_feed::BinanceFapi>>,
     pub http: Arc<reqwest::Client>,
     pub out_tx: broadcast::Sender<String>,
     pub snap: Arc<arc_swap::ArcSwap<String>>,
@@ -126,6 +133,7 @@ impl Engine {
     pub fn new(
         cfg: EngineConfig,
         clob: ClobClient,
+        fapi: Option<Arc<xarb_feed::BinanceFapi>>,
         out_tx: broadcast::Sender<String>,
         spin_mode: SpinMode,
         pins: PinPlan,
@@ -168,6 +176,7 @@ impl Engine {
             running: Arc::new(AtomicBool::new(true)),
             token_tx,
             clob: Arc::new(tokio::sync::Mutex::new(clob)),
+            fapi,
             http,
             out_tx,
             snap: Arc::new(arc_swap::ArcSwap::from_pointee(String::new())),
@@ -218,8 +227,9 @@ impl Engine {
         &self,
         signal: tokio::sync::mpsc::UnboundedSender<SignalEvt>,
         fill: tokio::sync::mpsc::UnboundedSender<FillEvent>,
+        hedge: tokio::sync::mpsc::UnboundedSender<HedgeFill>,
     ) {
-        *self.channels.lock().unwrap() = Some(Channels { signal, fill });
+        *self.channels.lock().unwrap() = Some(Channels { signal, fill, hedge });
     }
 
     pub(crate) fn signal_tx_get(&self) -> tokio::sync::mpsc::UnboundedSender<SignalEvt> {
@@ -228,5 +238,9 @@ impl Engine {
 
     pub(crate) fn fill_tx_get(&self) -> tokio::sync::mpsc::UnboundedSender<FillEvent> {
         self.channels.lock().unwrap().as_ref().expect("channels set").fill.clone()
+    }
+
+    pub(crate) fn hedge_tx_get(&self) -> tokio::sync::mpsc::UnboundedSender<HedgeFill> {
+        self.channels.lock().unwrap().as_ref().expect("channels set").hedge.clone()
     }
 }

@@ -114,9 +114,29 @@
     <div class="row"><span id="v-edge-note">—</span></div>
     <div class="row"><span>down edge <b id="v-edge2" class="mono-num">—</b></span></div>
   </div>
+
+  <div class="card"><h3>σ auto-cal · from live PM</h3>
+    <div class="big mono-num" id="v-sig">—</div>
+    <div class="row"><span>imp <b id="v-sig-i" class="mono-num">—</b></span><span>real <b id="v-sig-r" class="mono-num">—</b></span><span>floor <b id="v-sig-f" class="mono-num">—</b></span></div>
+    <div class="row"><span id="v-sig-note" class="mono-num">—</span></div>
+  </div>
+
+  <div class="card"><h3>δ-hedge · Binance</h3>
+    <div class="big mono-num" id="v-hq">—</div>
+    <div class="row"><span>target <b id="v-ht" class="mono-num">—</b></span><span>band ±<b id="v-hb" class="mono-num">—</b></span><span>Δ/sh <b id="v-hd" class="mono-num">—</b></span></div>
+    <div class="row"><span>uP&amp;L <b id="v-hp" class="mono-num">—</b></span><span>fees <b id="v-hfe" class="mono-num">—</b></span><span>fills <b id="v-hn" class="mono-num">—</b></span></div>
+  </div>
+
+  <div class="card"><h3>Value capture</h3>
+    <div class="big mono-num" id="v-cap">—</div>
+    <div class="row"><span>opps <b id="v-cap-o" class="mono-num">—</b></span><span>fired <b id="v-cap-f" class="mono-num">—</b></span><span>missed <b id="v-cap-m" class="em mono-num">0</b></span></div>
+    <div class="row"><span>edge seen <b id="v-cap-e" class="mono-num">—</b></span><span>early exits <b id="v-cap-x" class="mono-num">—</b></span></div>
+  </div>
+
   <div class="card"><h3>P&amp;L</h3>
     <div class="big mono-num" id="v-pnl">—</div>
     <div class="row"><span>open <b id="v-open" class="mono-num">—</b></span><span>W/L <b id="v-wl" class="mono-num">—</b></span><span>win% <b id="v-wr" class="mono-num">—</b></span></div>
+    <div class="row"><span>hedge fees <b id="v-pnl-hf" class="mono-num">—</b></span><span>pm fees <b id="v-pnl-pf" class="mono-num">—</b></span></div>
   </div>
 
   <div class="card wide"><h3>BTC vs strike</h3><canvas id="c-px"></canvas></div>
@@ -152,6 +172,7 @@
       <tr><td>word → detect</td><td class="num mono-num" id="l-det50">—</td><td class="num mono-num" id="l-det99">—</td></tr>
       <tr><td>detect → intent</td><td class="num mono-num" id="l-dec50">—</td><td class="num mono-num" id="l-dec99">—</td></tr>
       <tr><td>intent → fill</td><td class="num mono-num" id="l-fire50">—</td><td class="num mono-num" id="l-fire99">—</td></tr>
+      <tr><td>hedge policy+fill</td><td class="num mono-num" id="l-hedge50">—</td><td class="num mono-num" id="l-hedge99">—</td></tr>
     </table>
     <div class="row"><span class="mono-num" id="l-note">—</span></div>
     <div class="row"><span class="mono-num" id="l-health">—</span></div>
@@ -177,7 +198,7 @@
 
   <div class="card" style="grid-column: span 6;"><h3>Trades</h3>
     <div class="scroll"><table>
-      <thead><tr><th>time</th><th>id</th><th>side</th><th class="num">entry ¢</th><th class="num">shares</th><th class="num">cost</th><th class="num">fv@e</th><th class="num">edge@e</th><th>status</th><th class="num">pnl</th></tr></thead>
+      <thead><tr><th>time</th><th>id</th><th>side</th><th class="num">entry ¢</th><th class="num">shares</th><th class="num">fv@e</th><th class="num">net@e ¢</th><th class="num">hedge BTC</th><th class="num">hedge P&amp;L</th><th>status</th><th class="num">pnl</th><th class="num">exit</th></tr></thead>
       <tbody id="trd"></tbody>
     </table></div>
   </div>
@@ -196,10 +217,19 @@
       <label>taker fee bps <input type="range" id="set-fee" min="0" max="100" step="5" value="0"><b id="set-fee-v" class="mono-num">0</b></label>
       <label>book max age ms <input type="range" id="set-age" min="200" max="10000" step="100" value="3000"><b id="set-age-v" class="mono-num">3000</b></label>
       <label>daily loss kill $ <input type="number" id="set-kill" value="100" min="1" step="1" style="width:70px"></label>
+      <label>σ auto-cal <input type="checkbox" id="set-sigma" checked></label>
+      <label>σ implied weight % <input type="range" id="set-sigw" min="0" max="100" step="5" value="65"><b id="set-sigw-v" class="mono-num">65</b></label>
+      <label>σ floor × % <input type="range" id="set-sigk" min="30" max="150" step="5" value="75"><b id="set-sigk-v" class="mono-num">75</b></label>
+      <label>δ-hedge on <input type="checkbox" id="set-hedge" checked></label>
+      <label>hedge ratio % <input type="range" id="set-hratio" min="0" max="100" step="5" value="50"><b id="set-hratio-v" class="mono-num">50</b></label>
+      <label>hedge fee bps <input type="range" id="set-hfee" min="0" max="20" step="0.5" value="4.5"><b id="set-hfee-v" class="mono-num">4.5</b></label>
+      <label>min net edge ¢ <input type="range" id="set-netedge" min="0" max="20" step="0.5" value="1.5"><b id="set-netedge-v" class="mono-num">1.5</b></label>
+      <label>exit band ¢ <input type="range" id="set-exitband" min="0" max="15" step="1" value="2"><b id="set-exitband-v" class="mono-num">2</b></label>
+      <label>min capture ¢ <input type="range" id="set-capture" min="0" max="30" step="1" value="5"><b id="set-capture-v" class="mono-num">5</b></label>
     </div>
   </div>
 </div>
-<footer>XARB rust core v0.3 · Binance WS → SPSC ring → pinned FV thread → hot-word (1 load + AND + cmp) → strategy spin → executor · UP &amp; DOWN sides · local deployment</footer>
+<footer>XARB rust core v0.4 · σ auto-calibrated from live PM · fractional δ-hedge on Binance perp (Whalley–Wilmott bands) · net-edge profitability gate · every armed episode gets an explicit decision · local deployment</footer>
 
 <script>
 "use strict";
@@ -242,8 +272,8 @@ function connect() {
       $("b-mode").className = "badge " + (m.mode==="live" ? "live" : "on");
       renderSignals(m.signals||[]); renderTrades(m.trades||[]);
     } else if (m.type === "snap") { snap = m; pushChart(m.chart); }
-    else if (m.type === "signal") { pushSignal(m); if (m.action==="EXECUTED") toast(`BUY ${m.side||"UP"} filled @ ${(m.fillPrice??0).toFixed(1)}¢ · edge +${(m.edge??0).toFixed(1)}¢`); }
-    else if (m.type === "settle") { settleTrade(m); toast(`${m.status} · ${pnl(m.pnlUsd)}`, m.status==="LOST"); }
+    else if (m.type === "signal") { pushSignal(m); if (m.action==="EXECUTED") toast(`BUY ${m.side||"UP"} filled @ ${(m.fillPrice??0).toFixed(1)}¢ · edge +${(m.edge??0).toFixed(1)}¢`); else if (m.action==="HEDGE") toast(`δ-hedge ${(m.reason||"").slice(0,60)}`); else if (m.action==="EXIT") toast(`EXIT banked: ${(m.reason||"").slice(0,70)}`); }
+    else if (m.type === "settle") { settleTrade(m); toast(`${m.status} · ${pnl(m.pnlUsd)} · hedge ${pnl(m.hedgePnlUsd)}`, m.status==="LOST"); }
   };
 }
 connect();
@@ -334,6 +364,43 @@ function render() {
   $("v-open").textContent = p.open ?? 0;
   $("v-wl").textContent = `${p.wins ?? 0}/${p.losses ?? 0}`;
   $("v-wr").textContent = (p.winRate ?? 0).toFixed(0)+"%";
+  $("v-pnl-hf").textContent = "−$"+(p.hedgeFeesUsd ?? 0).toFixed(2);
+  $("v-pnl-pf").textContent = "−$"+(p.pmFeesUsd ?? 0).toFixed(2);
+
+  // v0.4 σ auto-calibration panel
+  const sg = s.fv?.sigma ?? {};
+  $("v-sig").textContent = (sg.eff ?? 0).toFixed(1) + " pts/√s";
+  $("v-sig").className = "big mono-num" + (sg.auto ? " em" : "");
+  $("v-sig-i").textContent = (sg.imp ?? 0).toFixed(1);
+  $("v-sig-r").textContent = (sg.real ?? 0).toFixed(1);
+  $("v-sig-f").textContent = (sg.floor ?? 0).toFixed(1);
+  $("v-sig-note").textContent = sg.auto
+    ? `auto: ${((sg.imp??0)/(Math.max(0.1,sg.real??0))).toFixed(1)}× imp/real blend · floor = 0.75·median(σ_imp)`
+    : "legacy fixed floor 15.5";
+
+  // v0.4 δ-hedge panel
+  const h = s.hedge ?? {};
+  const hq = h.qtyBtc ?? 0;
+  $("v-hq").textContent = h.on ? ((hq<0?"":"+") + hq.toFixed(3) + " BTC") : "off";
+  $("v-hq").className = "big mono-num " + (!h.on ? "" : hq < 0 ? "rd" : hq > 0 ? "em" : "");
+  $("v-ht").textContent = (h.targetBtc ?? 0).toFixed(3);
+  $("v-hb").textContent = (h.bandBtc ?? 0).toFixed(3);
+  $("v-hd").textContent = (h.deltaPerShare ?? 0).toFixed(5);
+  $("v-hp").textContent = pnl(h.pnlUsd ?? 0);
+  $("v-hp").className = "mono-num " + ((h.pnlUsd ?? 0) >= 0 ? "em" : "rd");
+  $("v-hfe").textContent = "$"+(h.feesUsd ?? 0).toFixed(2);
+  $("v-hn").textContent = h.fills ?? 0;
+
+  // v0.4 value-capture panel
+  const cp = s.capture ?? {};
+  const ratio = p.captureRatio ?? 0;
+  $("v-cap").textContent = ratio.toFixed(0) + "% captured";
+  $("v-cap").className = "big mono-num " + (ratio >= 40 ? "em" : ratio > 0 ? "am" : "");
+  $("v-cap-o").textContent = cp.opportunities ?? 0;
+  $("v-cap-f").textContent = cp.fired ?? 0;
+  $("v-cap-m").textContent = cp.engineMissed ?? 0;
+  $("v-cap-e").textContent = "$"+(cp.edgeSeenUsd ?? 0).toFixed(1);
+  $("v-cap-x").textContent = p.earlyExits ?? 0;
 
   // triggers (UP left, DOWN right)
   const t = s.triggers ?? {};
@@ -367,6 +434,8 @@ function render() {
   $("l-dec99").textContent = us(L.decide?.p99 ?? L.decisionUsP99 ?? 0);
   $("l-fire50").textContent = us(L.fire?.p50 ?? 0);
   $("l-fire99").textContent = us(L.fire?.p99 ?? 0);
+  $("l-hedge50").textContent = us(L.hedge?.p50 ?? 0);
+  $("l-hedge99").textContent = us(L.hedge?.p99 ?? 0);
   const trig = s.triggers ?? {};
   $("l-note").textContent = `hot path: ws parse → SPSC ring → pinned FV thread → u64 hot-word (1 load+AND+cmp) → executor${trig.kill ? " · KILL SWITCH ON" : ""}`;
   $("l-health").textContent = `domFallbacks ${L.domFallbacks ?? 0} · ringDropped ${L.ringDropped ?? 0} · pmFeeBps ${s.feeds?.polymarket?.feeRateBps ?? "—"}`;
@@ -412,9 +481,11 @@ function settleTrade(m) {
   $("trd").insertAdjacentHTML("afterbegin", trdRow(m));
 }
 function trdRow(t) {
-  const cls = t.status==="WON" ? "em" : t.status==="LOST" ? "rd" : "am";
+  const cls = t.status==="WON" ? "em" : t.status==="LOST" ? "rd" : t.status==="EXITED" ? "em" : "am";
   const scls = t.side==="DOWN" ? "bl" : "em";
-  return `<tr data-id="${t.id}"><td>${clock(t.ts)}</td><td>${t.id}</td><td class="${scls}">${t.side||"UP"}</td><td class="num mono-num">${(t.priceC??0).toFixed(1)}</td><td class="num mono-num">${(t.shares??0).toFixed(0)}</td><td class="num mono-num">$${(t.costUsd??0).toFixed(2)}</td><td class="num mono-num">${(t.fvAtEntry??0).toFixed(1)}</td><td class="num mono-num">${(t.edgeAtEntry??0).toFixed(1)}</td><td class="${cls}">${t.status}</td><td class="num mono-num ${cls}">${pnl(t.pnlUsd)}</td></tr>`;
+  const hq = t.hedgeQtyBtc ?? 0;
+  const exit = t.exitPxC != null ? t.exitPxC.toFixed(0)+"¢ "+(t.exitReason||"").slice(0,8) : (t.finalPrice!=null ? "settle" : "—");
+  return `<tr data-id="${t.id}"><td>${clock(t.ts)}</td><td>${t.id}</td><td class="${scls}">${t.side||"UP"}</td><td class="num mono-num">${(t.priceC??0).toFixed(1)}</td><td class="num mono-num">${(t.shares??0).toFixed(0)}</td><td class="num mono-num">${(t.fvAtEntry??0).toFixed(1)}</td><td class="num mono-num">${(t.netEdgeAtEntry??0).toFixed(1)}</td><td class="num mono-num">${hq!==0?((hq<0?"":"")+hq.toFixed(3)):"—"}</td><td class="num mono-num">${t.hedgePnlUsd?(t.hedgePnlUsd>=0?"+":"")+t.hedgePnlUsd.toFixed(2):"—"}</td><td class="${cls}">${t.status}</td><td class="num mono-num ${cls}">${pnl(t.pnlUsd)}</td><td class="num mono-num">${exit}</td></tr>`;
 }
 
 // ── charts ───────────────────────────────────────────────────────────────
@@ -498,9 +569,20 @@ bindRange("set-secs", "minSecsLeft");
 bindRange("set-max", "maxTradesPerWindow");
 bindRange("set-fee", "takerFeeBps");
 bindRange("set-age", "maxBookAgeMs");
+// percent-scaled sliders send the 0..1 fraction to the engine
+const pctBind = (id, key) => { $(id).oninput = () => { $(id+"-v").textContent = $(id).value; setting({[key]: +$(id).value/100}); }; };
+pctBind("set-sigw", "sigmaWImp");
+pctBind("set-sigk", "sigmaFloorK");
+pctBind("set-hratio", "hedgeRatio");
+bindRange("set-hfee", "hedgeFeeBps");
+bindRange("set-netedge", "minNetEdgeC");
+bindRange("set-exitband", "exitBandC");
+bindRange("set-capture", "minCaptureC");
 $("set-model").onchange = () => setting({model: $("set-model").value});
 $("set-auto").onchange = () => setting({autoTrade: $("set-auto").checked});
 $("set-down").onchange = () => setting({tradeDown: $("set-down").checked});
+$("set-sigma").onchange = () => setting({sigmaAuto: $("set-sigma").checked});
+$("set-hedge").onchange = () => setting({hedgeOn: $("set-hedge").checked});
 $("set-kill").onchange = () => setting({maxDailyLossUsd: +$("set-kill").value});
 $("set-stake").onchange = () => setting({stakeUsd: +$("set-stake").value});
 
@@ -508,9 +590,15 @@ function applySettings(s) {
   if (s.model) $("set-model").value = s.model;
   if (s.autoTrade != null) $("set-auto").checked = !!s.autoTrade;
   if (s.tradeDown != null) $("set-down").checked = !!s.tradeDown;
+  if (s.sigmaAuto != null) $("set-sigma").checked = !!s.sigmaAuto;
+  if (s.hedgeOn != null) $("set-hedge").checked = !!s.hedgeOn;
   if (s.maxDailyLossUsd != null) $("set-kill").value = s.maxDailyLossUsd;
   if (s.stakeUsd != null) $("set-stake").value = s.stakeUsd;
-  const map = {jumpThreshC:"set-jump", fvFloorC:"set-floor", edgeThreshC:"set-edge", minSecsLeft:"set-secs", maxTradesPerWindow:"set-max", takerFeeBps:"set-fee", maxBookAgeMs:"set-age"};
+  // percent-scaled ranges (UI % → engine 0..1)
+  if (s.sigmaWImp != null) { $("set-sigw").value = Math.round(s.sigmaWImp*100); $("set-sigw-v").textContent = Math.round(s.sigmaWImp*100); }
+  if (s.sigmaFloorK != null) { $("set-sigk").value = Math.round(s.sigmaFloorK*100); $("set-sigk-v").textContent = Math.round(s.sigmaFloorK*100); }
+  if (s.hedgeRatio != null) { $("set-hratio").value = Math.round(s.hedgeRatio*100); $("set-hratio-v").textContent = Math.round(s.hedgeRatio*100); }
+  const map = {jumpThreshC:"set-jump", fvFloorC:"set-floor", edgeThreshC:"set-edge", minSecsLeft:"set-secs", maxTradesPerWindow:"set-max", takerFeeBps:"set-fee", maxBookAgeMs:"set-age", hedgeFeeBps:"set-hfee", minNetEdgeC:"set-netedge", exitBandC:"set-exitband", minCaptureC:"set-capture"};
   for (const [k,id] of Object.entries(map)) {
     if (s[k] != null) { $(id).value = s[k]; const lab = $(id+"-v"); if (lab) lab.textContent = s[k]; }
   }

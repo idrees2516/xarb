@@ -18,6 +18,10 @@
 //! The same single thread also runs the REST degradation fallback, so the
 //! producer set stays exactly one thread.
 
+pub mod fapi;
+
+pub use fapi::BinanceFapi;
+
 use futures_util::{SinkExt, StreamExt};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;

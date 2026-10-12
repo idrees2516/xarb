@@ -149,7 +149,10 @@ async fn handle_intent(
             return skipped(intent, R_THIN_BOOK, &s);
         }
         let avg_c = (cost / shares) * 100.0;
-        let fee = cost * fee_of(intent.fee_bps, &pm, intent.side) / 10_000.0;
+        // v0.4: exchange fee formula (fee-on-proceeds): bps/10⁴ · min(p,1−p)
+        // · shares — the observed market fee wins over the settings knob
+        let fee_bps = fee_of(intent.fee_bps, pm, intent.side);
+        let fee = crate::hedger::pm_fee_c_per_share(avg_c / 100.0, fee_bps) * shares / 100.0;
         // claim the window slot (window_trades/open_trades are set here —
         // the single executor thread serializes all fires)
         risk.window_end_ms
@@ -191,7 +194,8 @@ async fn handle_intent(
     match clob.post_buy_order(&token_id, price, size, neg_risk).await {
         Ok((order_id, status, _raw)) => {
             let cost = price * size;
-            let fee_usd = cost * fee / 10_000.0;
+            // v0.4: exchange fee formula (fee-on-proceeds)
+            let fee_usd = crate::hedger::pm_fee_c_per_share(price, fee) * size / 100.0;
             risk.window_end_ms
                 .store(intent.window_end * 1000, Ordering::Relaxed);
             risk.window_trades.fetch_add(1, Ordering::Relaxed);

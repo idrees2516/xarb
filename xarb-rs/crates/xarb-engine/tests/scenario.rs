@@ -32,7 +32,7 @@ fn warm(c: &mut FvCore, price: f64, t_start: u64, ms: u64, up_ask: u16, dn_ask: 
     let mut t = t_start;
     while t < t_start + ms {
         c.on_ev(xarb_feed::Ev::Quote { bid: price, ask: price }, t);
-        c.fold_pm(up_cell(up_ask, t, true), down_cell(dn_ask, t, true));
+        c.fold_pm(up_cell(up_ask, t, true), down_cell(dn_ask, t, true), t);
         let _ = c.recompute(t, true, false);
         t += 50;
     }
@@ -54,7 +54,7 @@ fn spec_example_fires_all_three_triggers() {
         let frac = (t - t_jump) as f64 / 5_000.0;
         let price = 83_215.0 + frac * 115.0; // 83,215 → 83,330
         c.on_ev(xarb_feed::Ev::Quote { bid: price, ask: price }, t);
-        c.fold_pm(up_cell(56, t, true), down_cell(95, t, true));
+        c.fold_pm(up_cell(56, t, true), down_cell(95, t, true), t);
         let (word, full) = c.recompute(t, true, false);
         if fired_at.is_none() && word.fire_check() == FireHit::Up {
             fired_at = Some((t, full));
@@ -78,7 +78,7 @@ fn spec_example_fires_all_three_triggers() {
     let t_end = t_jump + 5_000;
     let (word_end, _) = {
         c.on_ev(xarb_feed::Ev::Quote { bid: 83_330.0, ask: 83_330.0 }, t_end);
-        c.fold_pm(up_cell(56, t_end, true), down_cell(95, t_end, true));
+        c.fold_pm(up_cell(56, t_end, true), down_cell(95, t_end, true), t_end);
         c.recompute(t_end, true, false)
     };
     assert_eq!(word_end.fire_check(), FireHit::Up);
@@ -99,7 +99,7 @@ fn repriced_pm_blocks_fire() {
         let frac = (t - t_jump) as f64 / 5_000.0;
         let price = 83_215.0 + frac * 115.0;
         c.on_ev(xarb_feed::Ev::Quote { bid: price, ask: price }, t);
-        c.fold_pm(up_cell(70, t, true), down_cell(95, t, true));
+        c.fold_pm(up_cell(70, t, true), down_cell(95, t, true), t);
         let (word, full) = c.recompute(t, true, false);
         if word.fire_check() != FireHit::None {
             ever_fired = true;
@@ -129,7 +129,7 @@ fn down_side_fires_symmetrically() {
         let frac = (t - t_jump) as f64 / 5_000.0;
         let price = 83_400.0 - frac * 300.0;
         c.on_ev(xarb_feed::Ev::Quote { bid: price, ask: price }, t);
-        c.fold_pm(up_cell(99, t, true), down_cell(55, t, true));
+        c.fold_pm(up_cell(99, t, true), down_cell(55, t, true), t);
         let (word, full) = c.recompute(t, true, false);
         if word.fire_check() == FireHit::Down {
             fired = true;
@@ -154,7 +154,7 @@ fn stale_book_blocks_edge_trigger() {
     let mut t = t0;
     while t < t0 + 10_000 {
         c.on_ev(xarb_feed::Ev::Quote { bid: 83_215.0, ask: 83_215.0 }, t);
-        c.fold_pm(stale, dn);
+        c.fold_pm(stale, dn, t);
         let _ = c.recompute(t, true, false);
         t += 50;
     }
@@ -166,7 +166,7 @@ fn stale_book_blocks_edge_trigger() {
         let frac = (t - t_jump) as f64 / 5_000.0;
         let price = 83_215.0 + frac * 115.0;
         c.on_ev(xarb_feed::Ev::Quote { bid: price, ask: price }, t);
-        c.fold_pm(stale, dn);
+        c.fold_pm(stale, dn, t);
         let (word, _) = c.recompute(t, true, false);
         if word.fire_check() != FireHit::None {
             ever_fired = true;
@@ -198,14 +198,14 @@ fn jump_reference_is_exactly_5s_old() {
     let t0 = 1_700_000_000_000u64;
     let mut c = core_at(83_200.0, t0, 130);
     c.on_ev(xarb_feed::Ev::Quote { bid: 83_215.0, ask: 83_215.0 }, t0);
-    c.fold_pm(up_cell(56, t0, true), down_cell(40, t0, true));
+    c.fold_pm(up_cell(56, t0, true), down_cell(40, t0, true), t0);
     let (w0, f0) = c.recompute(t0, true, false);
     // <5s of history → zero jump
     assert_eq!(f0.jump_up, 0.0);
     // 5.2s later, same PM, new price
     let t1 = t0 + 5_200;
     c.on_ev(xarb_feed::Ev::Quote { bid: 83_330.0, ask: 83_330.0 }, t1);
-    c.fold_pm(up_cell(56, t1, true), down_cell(40, t1, true));
+    c.fold_pm(up_cell(56, t1, true), down_cell(40, t1, true), t1);
     let (_, f1) = c.recompute(t1, true, false);
     // reference = the t0 sample (newest ≤ t1−5000) → jump ≈ 77.8−53.5
     assert!(f1.jump_up >= 20.0, "jump {}", f1.jump_up);

@@ -185,6 +185,7 @@ async fn executor_rejects_repriced_intents() {
         window_end: 12345,
         stake_usd: 20.0,
         fee_bps: 0.0,
+        ..Default::default()
     };
     fire_ring.try_push(intent);
 

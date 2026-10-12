@@ -1836,8 +1836,11 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "hex",
+ "hmac",
  "reqwest",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite 0.23.1",
  "xarb-core",
@@ -1882,6 +1885,7 @@ dependencies = [
  "tokio",
  "xarb-core",
  "xarb-engine",
+ "xarb-feed",
  "xarb-hft",
  "xarb-poly",
 ]

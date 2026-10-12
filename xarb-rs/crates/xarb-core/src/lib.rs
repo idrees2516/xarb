@@ -10,13 +10,18 @@
 pub mod book;
 pub mod coarse;
 pub mod fv;
+pub mod sigma;
 pub mod stats;
 pub mod trigger;
 pub mod types;
 
 pub use book::Book;
 pub use coarse::{mono_ns, now_ms, start_coarse_clock};
-pub use fv::{fv, sigma_eff, FvModel, FvOut, SIGMA_CAP_PTS, SIGMA_FLOOR_PTS};
+pub use fv::{
+    digital_delta_per_share, digital_gamma_per_share, fv, fv_eff, sigma_eff, FvModel, FvOut,
+    SIGMA_CAP_PTS, SIGMA_FLOOR_PTS,
+};
+pub use sigma::{norm_inv, SigmaCalib, SigmaCfg};
 pub use stats::{percentile, FvRing, Ring};
 pub use trigger::Trig;
 pub use types::{Level, Side};

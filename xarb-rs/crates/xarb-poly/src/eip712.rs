@@ -382,6 +382,68 @@ pub fn build_buy_order(
     })
 }
 
+/// Marketable SELL order (early exit / flatten): makerAmount = shares,
+/// takerAmount = collateral, side = 1. Price is rounded DOWN to the tick
+/// grid so the order crosses the bid and fills immediately (FOK).
+pub fn build_sell_order(
+    token_id_dec: &str,
+    price_dollars: f64,
+    size_shares: f64,
+    maker: [u8; 20],
+    tick_size: f64,
+    fee_rate_bps: u64,
+) -> Result<RawOrder> {
+    let tick = if tick_size.is_finite() && tick_size > 0.0 && tick_size <= 0.1 {
+        tick_size
+    } else {
+        0.01
+    };
+    if !(tick..=1.0).contains(&price_dollars) {
+        bail!("price out of range: {price_dollars}");
+    }
+    // floor to the tick grid (marketable SELL: cross the bid from above)
+    let ratio = price_dollars / tick;
+    let steps = (ratio + 1e-6).floor().max(1.0);
+    if steps > 999.0 {
+        bail!("price out of range: {price_dollars}");
+    }
+    let price = (steps * tick * 1e9).round() / 1e9;
+    if !(tick..=0.99).contains(&price) {
+        bail!("price out of range: {price}");
+    }
+    let shares = (size_shares * 100.0).floor() / 100.0;
+    if shares < 5.0 {
+        bail!("size below 5-share minimum: {shares}");
+    }
+    let taker = [0u8; 20];
+    let token = u256_from_dec(token_id_dec)?;
+    let share_raw = (shares * 1e6).round() as u128;
+    let collateral = ((share_raw as f64) * price).round() as u128;
+    let salt: u128 = {
+        use rand::RngCore;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let r = (rand::thread_rng().next_u32() % 1000) as u64;
+        (now_ms.wrapping_mul(1000).wrapping_add(r)) as u128
+    };
+    Ok(RawOrder {
+        salt,
+        maker,
+        signer: maker,
+        taker,
+        token_id: token,
+        maker_amount: share_raw,
+        taker_amount: collateral,
+        expiration: 0,
+        nonce: 0,
+        fee_rate_bps: fee_rate_bps as u128,
+        side: 1,
+        signature_type: 0,
+    })
+}
+
 // ── L2 HMAC headers ─────────────────────────────────────────────────────────
 
 /// L2 auth headers. POLY_SIGNATURE = HMAC-SHA256(base64-decoded secret,

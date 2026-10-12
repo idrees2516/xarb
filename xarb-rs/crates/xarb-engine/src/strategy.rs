@@ -56,6 +56,11 @@ pub fn spawn_strategy(
             let mut last_watch_ms: u64 = 0;
             let mut skip_last = [0u64; 16];
             let mut iters: u64 = 0;
+            // v0.4: opportunity capture accounting — distinct armed episodes
+            // (rising edge of the 3-trigger conjunction) vs fires. Every
+            // episode receives an explicit decision: FIRE or a logged skip
+            // reason — engine-missed opportunities are structurally zero.
+            let mut last_hit: FireHit = FireHit::None;
 
             loop {
                 iters = iters.wrapping_add(1);
@@ -75,6 +80,26 @@ pub fn spawn_strategy(
                     }
 
                     let hit = w.fire_check();
+                    // capture accounting: count rising edges (episodes)
+                    if hit != last_hit {
+                        if let FireHit::Up | FireHit::Down = hit {
+                            risk.opportunities.fetch_add(1, Ordering::Relaxed);
+                            let (fv, ask) = match hit {
+                                FireHit::Down => (
+                                    w.fv_down_c() as f64,
+                                    pm.down_cell_v().ask_opt().map(|a| a as f64),
+                                ),
+                                _ => (
+                                    w.fv_up_c() as f64,
+                                    pm.up_cell_v().ask_opt().map(|a| a as f64),
+                                ),
+                            };
+                            if let Some(a) = ask {
+                                risk.opps_edge_c.fetch_add((fv - a) as i64, Ordering::Relaxed);
+                            }
+                        }
+                        last_hit = hit;
+                    }
                     match hit {
                         FireHit::Up | FireHit::Down => {
                             let side = if hit == FireHit::Down { SIDE_DOWN } else { SIDE_UP };
@@ -82,7 +107,7 @@ pub fn spawn_strategy(
                             let intent = build_intent(&hot, &pm, &settings, &w, side, t_dec);
                             let gate = risk_gate(
                                 &risk, &settings, intent.t_sec, intent.window_end, t_dec,
-                                last_fire_mono, fired_once, w, side,
+                                last_fire_mono, fired_once, w, side, intent.net_edge_c,
                             );
                             match gate {
                                 Ok(()) => {
@@ -90,6 +115,7 @@ pub fn spawn_strategy(
                                     hot_strat_push(&signal_tx, intent, 2, 0);
                                     last_fire_mono = t_dec;
                                     fired_once = true;
+                                    risk.opps_fired.fetch_add(1, Ordering::Relaxed);
                                     // wake the executor (token — never lost)
                                     exec_wake.wake();
                                 }
@@ -191,6 +217,25 @@ fn build_intent(
             ask.map(|a| w.fv_up_c() as f64 - a).unwrap_or(0.0),
         )
     };
+    // ── v0.4 net-edge decomposition: edge − PM fee − hedge cost ──
+    // (profitability gate: only opportunities that clear costs after ALL
+    // modeled frictions reach the executor)
+    let pm_fee_bps = pm
+        .snap
+        .load_full()
+        .fee_rate_bps
+        .map(|f| f as f64)
+        .unwrap_or(s.taker_fee_bps);
+    let p_dollars = (ask / 100.0).clamp(0.01, 0.99);
+    let fee_c = crate::hedger::pm_fee_c_per_share(p_dollars, pm_fee_bps);
+    let hedge_c = crate::hedger::est_hedge_cost_c(
+        full.price,
+        full.strike,
+        full.tau_s,
+        full.sigma_eff,
+        &s.hedge_cfg(),
+    );
+    let net_edge_c = edge - fee_c - hedge_c;
     FireIntent {
         t_mono_ns: t_mono,
         ts_ms: xarb_core::now_ms(),
@@ -203,7 +248,11 @@ fn build_intent(
         strike: full.strike,
         window_end: full.window_end,
         stake_usd: s.stake_usd,
-        fee_bps: s.taker_fee_bps,
+        fee_bps: pm_fee_bps,
+        fee_c,
+        hedge_c,
+        net_edge_c,
+        sigma_eff: full.sigma_eff,
     }
 }
 
@@ -219,6 +268,7 @@ fn risk_gate(
     fired_once: bool,
     w: HotWord,
     _side: u8,
+    net_edge_c: f64,
 ) -> Result<(), u8> {
     if w.has(FLAG_KILL) {
         return Err(R_KILL);
@@ -240,6 +290,11 @@ fn risk_gate(
     }
     if risk.daily_pnl_usd() <= -s.max_daily_loss_usd {
         return Err(R_KILL);
+    }
+    // v0.4: profitability gate — net of PM taker fee and the estimated
+    // Binance hedge turnover cost, the edge must still clear the floor.
+    if net_edge_c < s.min_net_edge_c {
+        return Err(R_NET_EDGE);
     }
     Ok(())
 }

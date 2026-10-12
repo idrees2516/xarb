@@ -52,7 +52,13 @@ pub struct FvOut {
 
 /// Compute fair value. `sigma_pts` = realized vol in BTC points per √second.
 pub fn fv(s: f64, k: f64, t_sec: f64, sigma_pts: f64, model: FvModel) -> FvOut {
-    let sd = (sigma_eff(sigma_pts) * t_sec.max(1.0).sqrt()).max(5.0);
+    fv_eff(s, k, t_sec, sigma_eff(sigma_pts), model)
+}
+
+/// Fair value with an EXPLICIT effective σ (no legacy clamp) — used by the
+/// FV thread when σ auto-calibration supplies the blended/floored σ.
+pub fn fv_eff(s: f64, k: f64, t_sec: f64, sigma_eff_pts: f64, model: FvModel) -> FvOut {
+    let sd = (sigma_eff_pts * t_sec.max(1.0).sqrt()).max(5.0);
     let z = (s - k) / sd;
     let value = match model {
         FvModel::NormalCdf => (norm_cdf(z) * 100.0).clamp(1.0, 99.0),
@@ -66,6 +72,24 @@ pub fn fv(s: f64, k: f64, t_sec: f64, sigma_pts: f64, model: FvModel) -> FvOut {
         FvModel::Linear => (0.19 * (120.0 / t_sec.max(1.0)).sqrt()).clamp(0.1, 1.4),
     };
     FvOut { value, z, sd, slope }
+}
+
+/// Digital-option delta per UP share: BTC to short per $1 of BTC move
+/// (hedge qty per share = φ(d)/sd). Positive = long-direction exposure.
+/// DOWN shares carry the negated delta (long DOWN = short direction).
+#[inline]
+pub fn digital_delta_per_share(s: f64, k: f64, t_sec: f64, sigma_eff_pts: f64) -> f64 {
+    let sd = (sigma_eff_pts * t_sec.max(1.0).sqrt()).max(5.0);
+    norm_pdf((s - k) / sd) / sd
+}
+
+/// Digital-option position gamma magnitude per share (hedge-qty curvature,
+/// BTC per $): |d|·φ(d)/sd². Drives the Whalley–Wilmott re-hedge band.
+#[inline]
+pub fn digital_gamma_per_share(s: f64, k: f64, t_sec: f64, sigma_eff_pts: f64) -> f64 {
+    let sd = (sigma_eff_pts * t_sec.max(1.0).sqrt()).max(5.0);
+    let d = (s - k) / sd;
+    d.abs() * norm_pdf(d) / (sd * sd)
 }
 
 /// Abramowitz & Stegun 7.1.26 normal CDF (|err| < 7.5e-8).
@@ -125,5 +149,26 @@ mod tests {
         assert_eq!(v.value, 99.0);
         let v = fv(70_000.0, 80_000.0, 10.0, 7.5, FvModel::NormalCdf);
         assert_eq!(v.value, 1.0);
+    }
+
+    #[test]
+    fn digital_greeks_at_spec_point() {
+        // user's example state: S=83,330, K=83,200, τ=120s, σ_eff=15.5
+        // → sd ≈ 169.9, d ≈ 0.677, φ(0.677) ≈ 0.3178
+        let d = digital_delta_per_share(83_330.0, 83_200.0, 120.0, 15.5);
+        let sd = 15.5 * 120.0_f64.sqrt();
+        let expect = norm_pdf((83_330.0 - 83_200.0) / sd) / sd;
+        assert!((d - expect).abs() < 1e-12);
+        assert!(d > 0.0015 && d < 0.0020, "delta/share {d}"); // ≈0.00187 BTC
+        // digital gamma (|d|·φ(d)/sd²) peaks at |d| = 1 (the inflection
+        // zone), is zero at the money and decays deep OTM — the W-W band
+        // widens exactly where re-hedging costs matter most
+        let g_atm = digital_gamma_per_share(83_200.0, 83_200.0, 120.0, 15.5);
+        let sd120 = 15.5 * 120.0_f64.sqrt();
+        let s_peak = 83_200.0 + sd120; // |d| = 1
+        let g_peak = digital_gamma_per_share(s_peak, 83_200.0, 120.0, 15.5);
+        let g_deep = digital_gamma_per_share(83_600.0, 83_200.0, 120.0, 15.5);
+        assert!(g_peak > g_atm, "gamma peak {} vs ATM {}", g_peak, g_atm);
+        assert!(g_peak > g_deep * 3.0, "gamma peak {} vs deep {}", g_peak, g_deep);
     }
 }

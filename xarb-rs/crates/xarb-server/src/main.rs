@@ -84,7 +84,18 @@ async fn main() -> Result<()> {
     // ── engine ─────────────────────────────────────────────────────────────
     let (out_tx, _): (broadcast::Sender<String>, broadcast::Receiver<String>) =
         broadcast::channel(2048);
-    let engine = Engine::new(cfg, clob, out_tx, spin_mode, pins);
+    // Binance USDT-M futures client (live delta-hedge leg; None in paper)
+    let fapi = xarb_feed::BinanceFapi::from_env(mode != "live").map(Arc::new);
+    if let Some(f) = &fapi {
+        println!(
+            "[boot] Binance futures hedge leg: {}",
+            if f.is_testnet() { "testnet" } else { "MAINNET" }
+        );
+        if let Ok(bal) = f.ping().await {
+            println!("[boot] futures USDT balance: {bal:.2}");
+        }
+    }
+    let engine = Engine::new(cfg, clob, fapi, out_tx, spin_mode, pins);
     apply_env_settings(&engine);
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
     engine.start(ctrl_rx);
@@ -105,7 +116,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind :{port}"))?;
     println!(
-        "[boot] XARB rust core v0.3 — {} mode — http://127.0.0.1:{port}{}",
+        "[boot] XARB rust core v0.4 (δ-hedge + σ auto-cal) — {} mode — http://127.0.0.1:{port}{}",
         engine.cfg.mode,
         if engine.cfg.neg_risk { " (neg-risk)" } else { "" }
     );
@@ -156,6 +167,34 @@ fn apply_env_settings(engine: &Arc<Engine>) {
     }
     if let Some(v) = env_num("XARB_MAX_DAILY_LOSS") {
         j["maxDailyLossUsd"] = serde_json::json!(v);
+    }
+    // v0.4 knobs
+    if let Ok(v) = std::env::var("XARB_SIGMA_AUTO") {
+        j["sigmaAuto"] = serde_json::json!(v != "0" && !v.eq_ignore_ascii_case("false"));
+    }
+    if let Some(v) = env_num("XARB_SIGMA_W_IMP") {
+        j["sigmaWImp"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_SIGMA_ABS_FLOOR") {
+        j["sigmaAbsFloor"] = serde_json::json!(v);
+    }
+    if let Ok(v) = std::env::var("XARB_HEDGE_ON") {
+        j["hedgeOn"] = serde_json::json!(v != "0" && !v.eq_ignore_ascii_case("false"));
+    }
+    if let Some(v) = env_num("XARB_HEDGE_RATIO") {
+        j["hedgeRatio"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_HEDGE_FEE_BPS") {
+        j["hedgeFeeBps"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_MIN_NET_EDGE_C") {
+        j["minNetEdgeC"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_EXIT_BAND_C") {
+        j["exitBandC"] = serde_json::json!(v);
+    }
+    if let Some(v) = env_num("XARB_MIN_CAPTURE_C") {
+        j["minCaptureC"] = serde_json::json!(v);
     }
     if j.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
         engine.apply_settings(&j);

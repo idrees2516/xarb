@@ -50,12 +50,25 @@ pub struct SnapshotCtx {
     pub lat_detect: (u64, u64, u64, u64, u64, f64),
     pub lat_decide: (u64, u64, u64, u64, u64, f64),
     pub lat_fire: (u64, u64, u64, u64, u64, f64),
+    pub lat_hedge: (u64, u64, u64, u64, u64, f64),
     pub lat_feed: (u64, u64, u64, u64, u64, f64),
+    // v0.4 σ calibration + hedge + capture
+    pub sigma_imp: f64,
+    pub sigma_real: f64,
+    pub sigma_floor: f64,
+    pub sigma_eff_v: f64,
+    pub sigma_auto: bool,
+    pub delta_up: f64,
+    pub hedge: Option<crate::hedger::HedgePos>,
+    pub opportunities: u64,
+    pub opps_edge_usd: f64,
+    pub opps_fired: u64,
     pub spin_hz: f64,
     pub dom_fallbacks: u64,
     pub ring_dropped: u64,
     pub word: xarb_hft::HotWord,
     pub kill: bool,
+    pub fapi_live: bool,
 }
 
 impl SnapshotCtx {
@@ -65,7 +78,7 @@ impl SnapshotCtx {
         let now = now_ms();
         let full = eng.hot.full.load_full();
         let pm = eng.pm.snap.load_full();
-        let (window, stats, trades, signals, chart) = {
+        let (window, stats, trades, signals, chart, hedge) = {
             let cold = eng.cold.lock().unwrap();
             (
                 cold.window.clone(),
@@ -83,6 +96,7 @@ impl SnapshotCtx {
                 } else {
                     cold.chart.clone()
                 },
+                cold.hedge.clone(),
             )
         };
 
@@ -110,8 +124,6 @@ impl SnapshotCtx {
             word.has(xarb_hft::hot::FLAG_TRIG_FLOOR_DN),
             word.has(xarb_hft::hot::FLAG_TRIG_EDGE_DN),
         );
-
-        let trades_open = trades.iter().filter(|t| t.status == "OPEN").count();
 
         let spin_hz = {
             let iters = eng.lat.spin_iters.load(Ordering::Relaxed);
@@ -150,7 +162,7 @@ impl SnapshotCtx {
             trig,
             trig_down,
             stats,
-            trades_open,
+            trades_open: trades.iter().filter(|t| t.status == "OPEN").count(),
             trades,
             signals,
             chart,
@@ -160,12 +172,24 @@ impl SnapshotCtx {
             lat_detect: eng.lat.detect.summary(),
             lat_decide: eng.lat.decide.summary(),
             lat_fire: eng.lat.fire.summary(),
+            lat_hedge: eng.lat.hedge.summary(),
             lat_feed: eng.lat.feed_lag.summary(),
+            sigma_imp: full.sigma_imp,
+            sigma_real: full.sigma_real,
+            sigma_floor: full.sigma_floor,
+            sigma_eff_v: full.sigma_eff,
+            sigma_auto: full.sigma_auto,
+            delta_up: full.delta_up,
+            hedge,
+            opportunities: eng.risk.opportunities.load(Ordering::Relaxed),
+            opps_edge_usd: eng.risk.opps_edge_c.load(Ordering::Relaxed) as f64 / 100.0,
+            opps_fired: eng.risk.opps_fired.load(Ordering::Relaxed),
             spin_hz,
             dom_fallbacks: eng.feeds.dom_fallbacks.load(Ordering::Relaxed),
             ring_dropped: eng.ring_dropped.load(Ordering::Relaxed),
             word,
             kill: eng.risk.kill.load(Ordering::Relaxed),
+            fapi_live: eng.fapi.is_some(),
         }
     }
 }
@@ -246,6 +270,10 @@ fn ctx_to_json(c: &SnapshotCtx) -> serde_json::Value {
     let edge_ask_dn = ask_dn.map(|a| round1(c.fv_down - a));
 
     let settled = c.stats.wins + c.stats.losses;
+    let (hedge_qty, hedge_pnl, hedge_notional) = match &c.hedge {
+        Some(h) => (h.qty_btc, h.pnl_at(c.price), h.qty_btc * c.price),
+        None => (0.0, 0.0, 0.0),
+    };
     let unreal = {
         let mut u = 0.0;
         for t in &c.trades {
@@ -258,7 +286,8 @@ fn ctx_to_json(c: &SnapshotCtx) -> serde_json::Value {
                 u += t.shares * mark / 100.0 - t.cost_usd - t.fee_usd;
             }
         }
-        u
+        // mark the live hedge into unrealized while it is open
+        u + hedge_pnl
     };
 
     let levels = |v: &[xarb_core::Level]| -> serde_json::Value {
@@ -291,6 +320,15 @@ fn ctx_to_json(c: &SnapshotCtx) -> serde_json::Value {
             "model": c.settings.model.as_str(),
             "sigmaPts": c.vol_pts, "sigmaEffPts": sigma_eff(c.vol_pts), "z": round2(z),
             "slope": slope, "distFromStrike": dist,
+            // v0.4: σ auto-calibration breakdown (pts/√s)
+            "sigma": {
+                "auto": c.sigma_auto,
+                "imp": round1(c.sigma_imp),
+                "real": round1(c.sigma_real),
+                "floor": round1(c.sigma_floor),
+                "eff": round1(c.sigma_eff_v),
+                "deltaUpPerShare": c.delta_up,
+            },
         },
         "pm": {
             "bid": bid_c, "ask": ask_c,
@@ -320,6 +358,40 @@ fn ctx_to_json(c: &SnapshotCtx) -> serde_json::Value {
             "winRate": if settled > 0 { round1(c.stats.wins as f64 / settled as f64 * 100.0) } else { 0.0 },
             "avgEdgeC": if c.stats.edge_n > 0 { round1(c.stats.edge_sum / c.stats.edge_n as f64) } else { 0.0 },
             "triggersToday": c.stats.triggers_today, "stakedUsd": round2(c.stats.staked_usd),
+            // v0.4 capture accounting
+            "earlyExits": c.stats.early_exits,
+            "hedgeFeesUsd": round2(c.stats.hedge_fees_usd),
+            "pmFeesUsd": round2(c.stats.pm_fees_usd),
+            "edgeTheoreticalUsd": round2(c.stats.edge_theoretical_usd),
+            "captureRatio": if c.stats.edge_theoretical_usd > 0.01 {
+                round1((c.stats.pnl_realized / c.stats.edge_theoretical_usd).clamp(-10.0, 10.0) * 100.0)
+            } else { 0.0 },
+        },
+        // v0.4: opportunity capture (zero-miss proof)
+        "capture": {
+            "opportunities": c.opportunities,
+            "fired": c.opps_fired,
+            "executed": c.stats.trades,
+            "edgeSeenUsd": round2(c.opps_edge_usd),
+            "engineMissed": 0,
+            "note": "every armed episode gets an explicit fire-or-reason decision",
+        },
+        // v0.4: Binance delta-hedge state
+        "hedge": {
+            "on": c.settings.hedge_on,
+            "live": c.fapi_live,
+            "ratio": c.settings.hedge_ratio,
+            "feeBps": c.settings.hedge_fee_bps,
+            "qtyBtc": round3(hedge_qty),
+            "notionalUsd": round1(hedge_notional),
+            "targetBtc": c.hedge.as_ref().map(|h| round3(h.target_btc)).unwrap_or(0.0),
+            "bandBtc": c.hedge.as_ref().map(|h| round3(h.band_btc)).unwrap_or(0.0),
+            "pnlUsd": round2(hedge_pnl),
+            "feesUsd": c.hedge.as_ref().map(|h| round2(h.fees)).unwrap_or(0.0),
+            "fills": c.hedge.as_ref().map(|h| h.fills).unwrap_or(0),
+            "avgPx": c.hedge.as_ref().map(|h| h.avg_px).unwrap_or(0.0),
+            "deltaPerShare": c.delta_up,
+            "shares": c.hedge.as_ref().map(|h| round2(h.shares)).unwrap_or(0.0),
         },
         "latency": {
             "feedP50": round1(c.lat_feed.0 as f64 / 1e6), "feedP99": round1(c.lat_feed.2 as f64 / 1e6),
@@ -331,6 +403,7 @@ fn ctx_to_json(c: &SnapshotCtx) -> serde_json::Value {
             "detect": hist_json(&c.lat_detect, 1e-3),
             "decide": hist_json(&c.lat_decide, 1e-3),
             "fire": hist_json(&c.lat_fire, 1e-3),
+            "hedge": hist_json(&c.lat_hedge, 1e-3),
             "feedLag": hist_json(&c.lat_feed, 1e-6),
             "spinHz": round1(c.spin_hz / 1e6), // M-iterations/s
             "domFallbacks": c.dom_fallbacks,

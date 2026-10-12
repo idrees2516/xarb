@@ -18,7 +18,7 @@ use arc_swap::ArcSwap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use xarb_core::{fv as fv_calc, mono_ns, now_ms, FvOut};
+use xarb_core::{digital_delta_per_share, fv_eff, mono_ns, now_ms, FvOut, SigmaCalib};
 use xarb_feed::Ev;
 use xarb_hft::hot::{
     FLAG_AUTOTRADE, FLAG_BIN_ALIVE, FLAG_KILL, FLAG_MIN_SECS_OK, FLAG_PM_ALIVE,
@@ -64,6 +64,19 @@ pub struct FvFull {
     pub ticks: u64,
     pub ticks_per_min: u64,
     pub feed_lag_ms: f64,
+    // ── v0.4 σ auto-calibration state ──
+    /// Implied σ from live PM mids (EWMA, pts/√s).
+    pub sigma_imp: f64,
+    /// Realized σ (Binance 1s EWMA, pts/√s).
+    pub sigma_real: f64,
+    /// Dynamic σ floor (auto-calibrated from PM regime).
+    pub sigma_floor: f64,
+    /// σ_eff actually used by the FV model.
+    pub sigma_eff: f64,
+    /// σ auto-calibration mode flag.
+    pub sigma_auto: bool,
+    /// Digital delta per UP share (BTC) — feeds the Binance hedger.
+    pub delta_up: f64,
 }
 
 /// Pure FV state machine. All methods are deterministic given (state, now).
@@ -92,6 +105,9 @@ pub struct FvCore {
     // folded PM cells (raw packed values)
     up_cell_v: u64,
     dn_cell_v: u64,
+    // v0.4 σ auto-calibration from live PM prices
+    calib: SigmaCalib,
+    sigma_eff_v: f64,
     // last computed
     fv_up: f64,
     jump: f64,
@@ -124,6 +140,8 @@ impl FvCore {
             s_gen: 0,
             up_cell_v: 0,
             dn_cell_v: 0,
+            calib: SigmaCalib::new(Settings::default().sigma_cfg()),
+            sigma_eff_v: 15.5,
             fv_up: 50.0,
             jump: 0.0,
             ticks: 0,
@@ -137,15 +155,51 @@ impl FvCore {
     pub fn reload_settings(&mut self, s: &Settings, gen: u64) {
         self.s = s.clone();
         self.s_gen = gen;
+        self.calib.set_cfg(s.sigma_cfg());
     }
 
     pub fn settings_gen(&self) -> u64 {
         self.s_gen
     }
 
-    pub fn fold_pm(&mut self, up: QuoteCell, down: QuoteCell) {
+    /// σ calibration state (tests / cold snapshot).
+    pub fn sigma_state(&self) -> (f64, f64, f64, f64) {
+        (
+            self.calib.imp(),
+            self.calib.real(),
+            self.calib.floor(),
+            self.sigma_eff_v,
+        )
+    }
+
+    /// Fold PM cells + feed the σ calibrator on every book CHANGE.
+    /// The snap/identifiability semantics live in `SigmaCalib`; here we
+    /// only decide freshness and extract the mid.
+    pub fn fold_pm(&mut self, up: QuoteCell, down: QuoteCell, now: u64) {
+        let changed = up.0 != self.up_cell_v || down.0 != self.dn_cell_v;
         self.up_cell_v = up.0;
         self.dn_cell_v = down.0;
+        if !changed {
+            return;
+        }
+        let fresh = up.age_ms(now) <= 2_000 || down.age_ms(now) <= 2_000;
+        let mid = |c: &QuoteCell| -> Option<f64> {
+            let a = c.ask_opt();
+            let b = c.bid_opt();
+            match (a, b) {
+                (Some(a), Some(b)) => Some((a + b) as f64 * 0.5),
+                (Some(a), None) => Some((a.saturating_sub(1)) as f64),
+                (None, Some(b)) => Some((b + 1) as f64),
+                (None, None) => None,
+            }
+        };
+        let t_sec = if self.end_ms > now {
+            (self.end_ms - now) as f64 / 1000.0
+        } else {
+            0.0
+        };
+        self.calib
+            .observe_pm(mid(&up), mid(&down), self.mid(), self.strike, t_sec, now, fresh);
     }
 
     /// Window rollover: resets strike/end AND the FV history (jump stats are
@@ -164,6 +218,7 @@ impl FvCore {
     /// For deterministic scenario tests.
     pub fn set_vol_for_test(&mut self, v: f64) {
         self.vol_pts = v;
+        self.calib.observe_real(v);
     }
 
     pub fn on_ev(&mut self, ev: Ev, now: u64) {
@@ -308,11 +363,23 @@ impl FvCore {
             0.0
         };
 
+        // v0.4: σ from the PM auto-calibrator (implied + realized + floor
+        // + print-time snap). `fv_eff` consumes it directly — no legacy
+        // clamp on the hot path.
+        self.calib.observe_real(self.vol_pts);
+        let sigma = self.calib.effective(now);
+        self.sigma_eff_v = sigma;
+
         let out = if self.strike > 0.0 && t_sec > 0.0 && price > 0.0 {
-            fv_calc(price, self.strike, t_sec, self.vol_pts, self.s.model)
+            fv_eff(price, self.strike, t_sec, sigma, self.s.model)
         } else {
             // window closed / no strike: FV undefined → 50¢, no flags
             FvOut { value: 50.0, z: 0.0, sd: 0.0, slope: 0.0 }
+        };
+        let delta_up = if self.strike > 0.0 && t_sec > 0.0 && price > 0.0 {
+            digital_delta_per_share(price, self.strike, t_sec, sigma)
+        } else {
+            0.0
         };
 
         self.fv_up = out.value;
@@ -388,6 +455,12 @@ impl FvCore {
         }
 
         let jump_i16 = jump_c.clamp(-32_000.0, 32_000.0) as i16;
+        let (imp, real, floor, eff) = (
+            self.calib.imp(),
+            self.calib.real(),
+            self.calib.floor(),
+            self.sigma_eff_v,
+        );
         let word = HotWord::pack(fv_up_c, fv_dn_c, jump_i16, flags);
         let full = FvFull {
             t_ms: now,
@@ -411,6 +484,12 @@ impl FvCore {
             ticks: self.ticks,
             ticks_per_min: self.ticks_per_min,
             feed_lag_ms: self.lag_ewma_ms,
+            sigma_imp: imp,
+            sigma_real: real,
+            sigma_floor: floor,
+            sigma_eff: eff,
+            sigma_auto: self.s.sigma_auto,
+            delta_up,
         };
 
         (word, full)
@@ -511,8 +590,10 @@ pub fn spawn_fv(
                     activity = true;
                 }
 
-                // 2. fold PM cells (cheap: two atomic loads, done every pass)
-                core.fold_pm(pm.up_cell_v(), pm.down_cell_v());
+                // 2. fold PM cells (cheap: two atomic loads, done every pass);
+                //    book changes feed the σ auto-calibrator
+                let now0 = now_ms();
+                core.fold_pm(pm.up_cell_v(), pm.down_cell_v(), now0);
 
                 // 3. refresh settings on generation bump
                 let g = settings_gen.load(Ordering::Acquire);
