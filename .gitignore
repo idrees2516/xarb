@@ -1,2 +1,11 @@
 skills/
 node_modules/
+
+.next/
+dev.log
+*.pid
+db/
+tool-results/
+upload/
+scripts/gif/frames-*
+.DS_Store

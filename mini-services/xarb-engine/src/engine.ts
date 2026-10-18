@@ -297,6 +297,9 @@ export class Engine {
       minQtyBtc: m.spec.minQty,
       qtyStepBtc: m.spec.qtyStep,
       costTurnoverMult: DEFAULT_HEDGE_CFG.costTurnoverMult,
+      // hard notional cap on the hedge target: stake × 600 (risk-control —
+      // blocks model-σ blow-ups near expiry from demanding 7-figure hedges)
+      maxQtyBtc: Math.max((this.settings.stakeUsd * 600) / Math.max(price, 1e-9), m.spec.minQty * 2),
     }
   }
 
@@ -630,6 +633,13 @@ export class Engine {
     }
     if (!win.tokensLoaded) {
       this.logSkip(m, side, 'window book not loaded', fv, jump, gapC, tSec)
+      return
+    }
+    // dead-quote guard: sub-3¢ asks on a near-expiry book are stale ghost
+    // liquidity — the fill sizing (stake / ask) explodes the share count and
+    // the model delta then demands an absurd hedge. Reject the junk.
+    if (askC < 3) {
+      this.logSkip(m, side, `dead quote (ask ${askC.toFixed(1)}¢ < 3¢)`, fv, jump, gapC, tSec)
       return
     }
 

@@ -56,6 +56,9 @@ export interface HedgeCfg {
   /** Turnover multiplier for the cost model (initial + ~2 rebalances +
    *  flatten ≈ 2.5 round trips of the entry delta). */
   costTurnoverMult: number
+  /** Hard cap on |hedge target| (BTC) — stake-scaled risk control. Blocks
+   *  model-σ blow-ups near expiry from demanding 7-figure hedge notionals. */
+  maxQtyBtc: number
 }
 
 export const DEFAULT_HEDGE_CFG: HedgeCfg = {
@@ -69,6 +72,7 @@ export const DEFAULT_HEDGE_CFG: HedgeCfg = {
   minQtyBtc: 0.001,
   qtyStepBtc: 0.001,
   costTurnoverMult: 2.5,
+  maxQtyBtc: 10,
 }
 
 export function hedgeFeeFrac(cfg: HedgeCfg): number {
@@ -184,18 +188,20 @@ export function hedgeStep(
     return null
   }
 
-  // target hedge quantity
+  // target hedge quantity (clamped to the hard notional cap — the model
+  // delta of a cheap near-expiry digital can demand a huge hedge; the cap
+  // keeps the position bounded by what the stake actually risks)
   const dlt = digitalDeltaPerShare(s, pos.strike, tau, sigmaEff)
   const dir = pos.side === SIDE_DOWN ? -1 : 1
-  const target = -dir * pos.shares * dlt * cfg.ratio
+  const rawTarget = -dir * pos.shares * dlt * cfg.ratio
+  const target = Math.max(-cfg.maxQtyBtc, Math.min(cfg.maxQtyBtc, rawTarget))
 
-  // wind-down: digital decided (|d| > 1.2) and near expiry → delta is
-  // collapsing on its own; trading now only pays into the gamma explosion
-  const sd = Math.max(sigmaEff * Math.sqrt(Math.max(tau, 1)), 5)
-  const d = ((s - pos.strike) / sd) * dir
-  if (tau <= cfg.winddownS && Math.abs(d) > 1.2) {
-    // still bound to the band against the collapsing target, but never
-    // ADD fresh hedge exposure in the wind-down zone
+  // wind-down: in the last winddown_s seconds the digital is close to
+  // decided — its delta is collapsing (or exploding through a model-σ
+  // artifact) and trading into it only pays the expiry gamma. UNCONDITIONAL
+  // add-block: never ADD fresh hedge exposure in the wind-down zone; only
+  // risk-reducing moves toward flat are allowed.
+  if (tau <= cfg.winddownS) {
     const drift = pos.qtyBtc - target
     if (Math.abs(drift) < Math.max(cfg.minBandBtc, pos.bandBtc)) return null
     // allow only risk-REDUCing moves (toward flat)
